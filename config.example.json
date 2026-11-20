@@ -16,6 +16,12 @@
       "max_reviews": 2000,
       "page_sleep_sec": 1.0
     },
+    "events": {
+      "enabled": true,
+      "keywords": ["update", "patch", "hotfix", "アップデート", "更新", "修正"],
+      "version_pattern": true,
+      "feed_count": 20
+    },
     "surge": {
       "recent_hours": 24,
       "baseline_days": 28,

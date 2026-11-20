@@ -17,10 +17,16 @@
     python steam_review_analytics.py --config config.json digest --dry-run（表示のみ）
     python steam_review_analytics.py --config config.json check-surge   （急増検知のみ）
     python steam_review_analytics.py --config config.json backfill      （過去分をさかのぼって取り込む）
+    python steam_review_analytics.py --config config.json sync-events   （公式発表からイベント候補を登録）
+    python steam_review_analytics.py --config config.json events        （登録済みイベントの一覧）
+    python steam_review_analytics.py --config config.json add-event --appid 123 --date 2026-11-15 --title "大型アップデート"
+    python steam_review_analytics.py --config config.json remove-event --appid 123 --event-id feed-456
 """
 
 import argparse
+import hashlib
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -111,6 +117,17 @@ class ReviewStore:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE TABLE IF NOT EXISTS events (
+                appid TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                title TEXT,
+                event_ts INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'feed',
+                url TEXT,
+                PRIMARY KEY (appid, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_app_ts
+                ON events (appid, event_ts);
             """
         )
         self.conn.commit()
@@ -215,6 +232,56 @@ class ReviewStore:
         )
         self.conn.commit()
 
+    def upsert_event(self, appid, event_id, title, event_ts, source="feed", url=None):
+        """イベントを保存する（同じ appid × event_id は上書き）。"""
+        self.conn.execute(
+            """
+            INSERT INTO events (appid, event_id, title, event_ts, source, url)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(appid, event_id) DO UPDATE SET
+                title = excluded.title,
+                event_ts = excluded.event_ts,
+                source = excluded.source,
+                url = excluded.url
+            """,
+            (str(appid), str(event_id), title or "", int(event_ts), source, url or ""),
+        )
+        self.conn.commit()
+
+    def list_events(self, appid):
+        """イベントを新しい順に返す。"""
+        rows = self.conn.execute(
+            """
+            SELECT * FROM events WHERE appid = ?
+            ORDER BY event_ts DESC
+            """,
+            (str(appid),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def latest_event(self, appid, at_or_before=None):
+        """指定時刻以前で最も新しいイベントを返す。無ければ None。"""
+        if at_or_before is None:
+            rows = self.list_events(appid)
+            return rows[0] if rows else None
+        row = self.conn.execute(
+            """
+            SELECT * FROM events WHERE appid = ? AND event_ts <= ?
+            ORDER BY event_ts DESC LIMIT 1
+            """,
+            (str(appid), int(at_or_before)),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_event(self, appid, event_id):
+        """イベントを削除する。削除できたら True。"""
+        cur = self.conn.execute(
+            "DELETE FROM events WHERE appid = ? AND event_id = ?",
+            (str(appid), str(event_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
 
 def window_stats(reviews):
     """レビューのリストから集計値を返す。"""
@@ -265,7 +332,7 @@ def _digest_conclusion(cur, prev):
     return "概ね安定しています（おすすめ率 {:.0f}%）".format(ratio * 100)
 
 
-def build_digest_text(store, appid, app_name, now=None, days=7):
+def build_digest_text(store, appid, app_name, now=None, days=7, config=None):
     """週次ダイジェストのテキストを生成する。"""
     now = int(now if now is not None else time.time())
     cur_start = now - days * DAY
@@ -280,6 +347,10 @@ def build_digest_text(store, appid, app_name, now=None, days=7):
     )
     lines.append("結論：{}".format(_digest_conclusion(cur, prev)))
     if cur["total"] == 0:
+        events_cfg = ((config or {}).get("analytics", {}) or {}).get("events")
+        lines.extend(
+            build_event_comparison_lines(store, appid, now=now, days=days, cfg=events_cfg)
+        )
         lines.append("https://store.steampowered.com/app/{}/".format(appid))
         return "\n".join(lines)
 
@@ -315,6 +386,11 @@ def build_digest_text(store, appid, app_name, now=None, days=7):
             link = review_permalink(r)
             if link:
                 lines.append(link)
+    # イベント前後の比較（イベントがあるタイトルだけ）
+    events_cfg = ((config or {}).get("analytics", {}) or {}).get("events")
+    lines.extend(
+        build_event_comparison_lines(store, appid, now=now, days=days, cfg=events_cfg)
+    )
     lines.append("https://store.steampowered.com/app/{}/".format(appid))
     return "\n".join(lines)
 
@@ -499,12 +575,146 @@ def backfill_history(store, appid, fetch_page, cfg=None, now=None, sleep=None):
     return {"status": status, "fetched": fetched, "reason": reason, "pages": pages}
 
 
+DEFAULT_EVENTS = {
+    "enabled": True,  # 公式発表からのイベント候補の抽出・前後比較を使うか
+    # タイトルに含まれていたらイベント候補にするキーワード（小文字で比較）
+    "keywords": ["update", "patch", "hotfix", "アップデート", "更新", "修正"],
+    "version_pattern": True,  # 「1.6.14」のようなバージョン番号らしい文字列も候補にする
+    "feed_count": 20,          # 1回の同期で取得する公式発表の件数
+}
+
+# 「1.6.14」「v2.0」「Ver2.5」のようなバージョン番号らしい文字列
+_VERSION_RE = re.compile(r"\b(?:ver\.?\s*)?v?\d+\.\d+(?:\.\d+)?\b", re.IGNORECASE)
+
+
+def is_event_candidate(title, cfg=None):
+    """公式発表のタイトルが「イベント候補」かどうかを判定する。
+
+    あくまで候補であり、実際のアップデートかどうかは断定しない
+    （告知があっても内容がアップデートとは限らないため）。
+    """
+    cfg = {**DEFAULT_EVENTS, **(cfg or {})}
+    t = title or ""
+    low = t.lower()
+    for kw in cfg.get("keywords") or []:
+        if kw and str(kw).lower() in low:
+            return True
+    if cfg.get("version_pattern", True) and _VERSION_RE.search(t):
+        return True
+    return False
+
+
+def extract_event_candidates(news_items, cfg=None):
+    """公式発表のリストからイベント候補だけを抽出して返す。"""
+    cfg = {**DEFAULT_EVENTS, **(cfg or {})}
+    if not cfg.get("enabled", True):
+        return []
+    candidates = []
+    for item in news_items or []:
+        title = item.get("title") or ""
+        if not is_event_candidate(title, cfg):
+            continue
+        candidates.append(
+            {
+                "event_id": "feed-{}".format(item.get("gid") or ""),
+                "title": title,
+                "event_ts": int(item.get("date", 0) or 0),
+                "url": item.get("url") or "",
+            }
+        )
+    return candidates
+
+
+def sync_feed_events(store, appid, news_items, cfg=None):
+    """公式発表からイベント候補を抽出して保存する。保存した候補の件数を返す。"""
+    candidates = extract_event_candidates(news_items, cfg)
+    for c in candidates:
+        if c["event_ts"] > 0:
+            store.upsert_event(
+                appid, c["event_id"], c["title"], c["event_ts"],
+                source="feed", url=c["url"],
+            )
+    return len(candidates)
+
+
+def add_manual_event(store, appid, title, event_ts):
+    """手動イベントを追加する。event_id を返す。"""
+    digest = hashlib.sha1(
+        "{}:{}".format(title, int(event_ts)).encode("utf-8")
+    ).hexdigest()[:12]
+    event_id = "manual-{}".format(digest)
+    store.upsert_event(appid, event_id, title, int(event_ts), source="manual", url="")
+    return event_id
+
+
+def _lang_summary(stats, limit=3):
+    parts = [
+        "{} {}件".format(language_name(code), n)
+        for code, n in stats["languages"].most_common(limit)
+    ]
+    return "、".join(parts) if parts else "—"
+
+
+def build_event_comparison_lines(store, appid, now=None, days=7, cfg=None):
+    """直近のイベントを境にした「前（同日数）vs 後」の比較セクションを作る。
+
+    イベントが無いタイトルでは空リストを返す（セクション自体を出さない）。
+    """
+    cfg = {**DEFAULT_EVENTS, **(cfg or {})}
+    if not cfg.get("enabled", True):
+        return []
+    now = int(now if now is not None else time.time())
+    event = store.latest_event(appid, at_or_before=now)
+    if event is None:
+        return []
+    ets = int(event["event_ts"])
+    span = int(days) * DAY
+    before = window_stats(store.reviews_between(appid, ets - span, ets))
+    after_end = min(ets + span, now)
+    after = window_stats(store.reviews_between(appid, ets, after_end))
+
+    def ratio_txt(stats):
+        return (
+            "{:.0f}%".format(stats["up_ratio"] * 100)
+            if stats["up_ratio"] is not None else "—"
+        )
+
+    lines = []
+    lines.append(
+        "▼ イベント前後の比較：「{}」（{}）".format(event["title"], _fmt_date(ets))
+    )
+    if ets + span > now:
+        lines.append("※イベント後はまだ{}日分そろっていません（集計途中）".format(days))
+    lines.append(
+        "前（{}日）：{}件｜👍 {} / 👎 {}｜おすすめ率 {}".format(
+            days, before["total"], before["up"], before["down"], ratio_txt(before)
+        )
+    )
+    lines.append(
+        "後（{}日）：{}件｜👍 {} / 👎 {}｜おすすめ率 {}".format(
+            days, after["total"], after["up"], after["down"], ratio_txt(after)
+        )
+    )
+    lines.append("言語（前）：{}".format(_lang_summary(before)))
+    lines.append("言語（後）：{}".format(_lang_summary(after)))
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description="こえびん 分析層（ダイジェスト／急増検知）")
     parser.add_argument("--config", default="config.json", help="設定ファイルのパス")
-    parser.add_argument("command", choices=["digest", "check-surge", "backfill"], help="実行する処理")
+    parser.add_argument(
+        "command",
+        choices=["digest", "check-surge", "backfill", "sync-events", "events",
+                 "add-event", "remove-event"],
+        help="実行する処理",
+    )
     parser.add_argument("--dry-run", action="store_true", help="送信せず標準出力に表示する")
     parser.add_argument("--force", action="store_true", help="backfill を実施済みでも再実行する")
+    parser.add_argument("--appid", help="add-event / remove-event の対象タイトル")
+    parser.add_argument("--date", help="add-event の日付（YYYY-MM-DD）")
+    parser.add_argument("--title", help="add-event のイベント名")
+    parser.add_argument("--event-id", help="remove-event で消すイベントのID")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -514,7 +724,67 @@ def main():
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
     # 通知の組み立ては通知ツール側の実装を再利用する
-    from steam_review_notifier import build_notifier, fetch_app_name, fetch_reviews_page
+    from steam_review_notifier import (
+        build_notifier,
+        fetch_announcements,
+        fetch_app_name,
+        fetch_reviews_page,
+    )
+
+    if args.command in ("sync-events", "events", "add-event", "remove-event"):
+        store = open_store(config, config_path.parent)
+        try:
+            app_ids = [str(a) for a in config.get("app_ids", [])]
+            if args.command == "sync-events":
+                events_cfg = (config.get("analytics", {}) or {}).get("events")
+                feed_count = int(
+                    {**DEFAULT_EVENTS, **(events_cfg or {})}.get("feed_count", 20)
+                )
+                for appid in app_ids:
+                    items = fetch_announcements(
+                        appid, count=feed_count,
+                        base_url=config.get("_news_base_url"),
+                    )
+                    n = sync_feed_events(store, appid, items, cfg=events_cfg)
+                    print("appid={}: イベント候補 {} 件を登録しました".format(appid, n))
+            elif args.command == "events":
+                for appid in app_ids:
+                    events = store.list_events(appid)
+                    print("appid={}: {} 件".format(appid, len(events)))
+                    for ev in events:
+                        print(
+                            "  {} | {} | {} | {}".format(
+                                ev["event_id"],
+                                datetime.fromtimestamp(
+                                    ev["event_ts"], tz=timezone.utc
+                                ).astimezone().strftime("%Y-%m-%d"),
+                                ev["source"],
+                                ev["title"],
+                            )
+                        )
+            elif args.command == "add-event":
+                if not args.appid or not args.date or not args.title:
+                    print("add-event には --appid, --date, --title が必要です", file=sys.stderr)
+                    return 1
+                try:
+                    ts = int(
+                        datetime.strptime(args.date, "%Y-%m-%d")
+                        .replace(tzinfo=timezone.utc).timestamp()
+                    )
+                except ValueError:
+                    print("--date は YYYY-MM-DD で指定してください", file=sys.stderr)
+                    return 1
+                event_id = add_manual_event(store, str(args.appid), args.title, ts)
+                print("登録しました: {}".format(event_id))
+            else:  # remove-event
+                if not args.appid or not args.event_id:
+                    print("remove-event には --appid, --event-id が必要です", file=sys.stderr)
+                    return 1
+                ok = store.delete_event(str(args.appid), args.event_id)
+                print("削除しました" if ok else "該当するイベントがありませんでした")
+        finally:
+            store.close()
+        return 0
 
     if args.command == "backfill":
         store = open_store(config, config_path.parent)
@@ -567,7 +837,7 @@ def main():
                 name = fetch_app_name(appid)
                 store.set_app_name(appid, name)
             if args.command == "digest":
-                notify(build_digest_text(store, appid, name))
+                notify(build_digest_text(store, appid, name, config=config))
             else:
                 sent = evaluate_and_alert(store, config, appid, name, notify)
                 print("appid={}: {}".format(appid, "アラート送信" if sent else "急増なし"))

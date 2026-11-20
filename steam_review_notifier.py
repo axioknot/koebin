@@ -32,6 +32,7 @@ from pathlib import Path
 
 STEAM_REVIEWS_URL = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/"
 STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
+STEAM_NEWS_URL = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/"
 USER_AGENT = "Koebin/0.2 (+https://x.com/axioknot_jp)"
 
 PENDING_KEY = "__pending__"  # state.json 内で「送信に失敗して再送待ち」のレビューを置くキー
@@ -70,16 +71,20 @@ def language_name(code):
 # 分析層（履歴の蓄積・急増検知・バックフィル）は任意モジュール。無くても通知は動く。
 try:
     from steam_review_analytics import (
+        DEFAULT_EVENTS,
         ReviewStore,
         backfill_history,
         evaluate_and_alert,
         open_store,
+        sync_feed_events,
     )
 except Exception:
+    DEFAULT_EVENTS = {}
     ReviewStore = None
     backfill_history = None
     evaluate_and_alert = None
     open_store = None
+    sync_feed_events = None
 
 
 def http_get_json(url, params):
@@ -157,6 +162,29 @@ def fetch_recent_reviews(appid, num=20, base_url=None):
     """新着順にレビューを1ページ分取得する。"""
     reviews, _ = fetch_reviews_page(appid, cursor="*", num=num, base_url=base_url)
     return reviews
+
+
+def fetch_announcements(appid, count=20, base_url=None):
+    """公式発表（Steam Community Announcements）を取得する。APIキーは不要。
+
+    ISteamNews/GetNewsForApp に feeds=steam_community_announcements を指定すると、
+    そのゲームの公式発表が日付つきで返る（アップデート告知も、それ以外も混ざる）。
+    返り値は newsitems のリスト（各要素に gid / title / url / date が入る）。
+    """
+    url = base_url or STEAM_NEWS_URL
+    data = http_get_json(
+        url,
+        {
+            "appid": appid,
+            "count": count,
+            "maxlength": 0,
+            "feeds": "steam_community_announcements",
+        },
+    )
+    appnews = data.get("appnews", {})
+    if not isinstance(appnews, dict):
+        raise ValueError("Steam News APIから想定外の応答が返りました")
+    return appnews.get("newsitems", []) or []
 
 
 def fetch_reviews_until(appid, known_ids=None, page_size=20, max_pages=MAX_FETCH_PAGES,
@@ -371,6 +399,36 @@ def _maybe_backfill(config, store, appid):
         print("[警告] appid={} の過去分取り込みに失敗しました: {}".format(appid, e), file=sys.stderr)
 
 
+EVENTS_SYNC_INTERVAL_SEC = 24 * 3600  # 公式発表の同期は1日1回まで
+
+
+def _maybe_sync_events(config, store, appid):
+    """公式発表からイベント候補を同期する（1日1回まで、失敗しても通知は続ける）。"""
+    if store is None or sync_feed_events is None:
+        return
+    events_cfg = (config.get("analytics", {}) or {}).get("events") or {}
+    merged = {**DEFAULT_EVENTS, **events_cfg}
+    if not merged.get("enabled", True):
+        return
+    try:
+        key = "events_sync:{}".format(appid)
+        last = store.get_meta(key)
+        now = int(time.time())
+        if last is not None and now - int(last) < EVENTS_SYNC_INTERVAL_SEC:
+            return
+        items = fetch_announcements(
+            appid,
+            count=int(merged.get("feed_count", 20)),
+            base_url=config.get("_news_base_url"),
+        )
+        n = sync_feed_events(store, appid, items, cfg=events_cfg)
+        store.set_meta(key, now)
+        if n:
+            print("[イベント] appid={}: 公式発表からイベント候補 {} 件を登録しました".format(appid, n))
+    except Exception as e:
+        print("[警告] appid={} のイベント同期に失敗しました: {}".format(appid, e), file=sys.stderr)
+
+
 def load_state(path):
     if not path.exists():
         return {}
@@ -495,6 +553,7 @@ def check_once(config, state_path, notify, store=None):
             except Exception as e:
                 print("[警告] appid={} の履歴保存に失敗しました: {}".format(appid, e), file=sys.stderr)
             _maybe_backfill(config, store, appid)
+            _maybe_sync_events(config, store, appid)
         current_ids = [r.get("recommendationid") for r in reviews]
         if is_baseline:
             # 初回: 既存レビューは通知せず、既読として記録するだけ

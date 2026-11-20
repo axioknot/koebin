@@ -104,6 +104,34 @@ https://steamcommunity.com/profiles/76561198000000000/recommended/1234560/
 （`min_recent_reviews` 直近の件数の下限、`ratio_delta` 平常時をどれだけ上回ったら鳴らすか、など）。
 同じタイトルへのアラートは24時間に1回までです。
 
+### イベント前後の比較
+
+アップデートのような「イベント」を境に、その前後でレビューの動きがどう変わったかを比べます。
+週次ダイジェストに、直近のイベントについて「前（7日）vs 後（7日）」の件数・おすすめ率・言語の内訳を比べるセクションが付きます（イベントが無いタイトルでは付きません）。
+
+イベントの出どころは、そのゲームの公式発表です。Steamの公式ニュースAPI
+（ISteamNews/GetNewsForApp、`feeds=steam_community_announcements`）で発表を取得し、
+タイトルに `update` `patch` `アップデート` などを含むものや、「1.6.14」のような
+バージョン番号らしい文字列を含むものを「イベント候補」として自動で登録します
+（通常のチェックのついでに、1日1回まで自動で取りに行きます）。
+候補にするキーワードは `config.json` の `analytics.events.keywords` で変更でき、
+`analytics.events.enabled` を `false` にすると、この機能全体を止められます。
+
+手動での管理もできます。
+
+```
+python steam_review_analytics.py --config config.json sync-events   # 公式発表から候補を取り込む
+python steam_review_analytics.py --config config.json events        # 登録済みイベントの一覧
+python steam_review_analytics.py --config config.json add-event --appid 1234560 --date 2026-11-15 --title "大型アップデート"
+python steam_review_analytics.py --config config.json remove-event --appid 1234560 --event-id feed-456
+```
+
+限界も正直に書いておきます。
+
+- 告知のないアップデートは拾えません（その場合は `add-event` で足してください）
+- 判定は告知のタイトルだけで行うため、実際のアップデートでない告知が候補に入ることがあります。あくまで「候補」として扱い、違うものは `remove-event` で消す前提です
+- レビュー自体にはバージョン情報がないため、比較は「イベントの日付の前後」での集計です。数字の変化がそのイベントによるものかどうかまでは断定できません
+
 ### 通知の見た目（色分けの方針）
 
 通知は「結論 → 数字 → 代表レビュー → リンク」の順で、3秒で要点が分かる並びにしています。
