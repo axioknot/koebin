@@ -26,6 +26,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -650,24 +651,43 @@ def deliver(notify, message, only=None):
         return {"default": False}
 
 
+_TRANSLATE_LINK_RE = re.compile(r"翻訳で読む: (https?://\S+)")
+
+
+def to_discord_format(message):
+    """Discord 向けの整形。翻訳リンクは長い URL をそのまま見せず、
+
+    [翻訳で読む](URL) のマスクリンクにする（URL が画面を占有しないように）。
+    """
+    return _TRANSLATE_LINK_RE.sub(r"[翻訳で読む](\1)", message)
+
+
 def make_discord_notifier(webhook_url):
     def notify(message):
         # allowed_mentions を空にし、レビュー本文中の @everyone 等が効かないようにする
         http_post_json(
             webhook_url,
-            {"content": message[:1900], "allowed_mentions": {"parse": []}},
+            {"content": to_discord_format(message)[:1900],
+             "allowed_mentions": {"parse": []}},
         )
 
     return notify
 
 
 def to_slack_format(message):
-    """Slack の mrkdwn では太字は *1つ* で書く。Discord 形式の ** を * に直す。"""
+    """Slack の mrkdwn では太字は *1つ* で書く。Discord 形式の ** を * に直す。
+
+    翻訳リンクは <URL|翻訳で読む> のマスクリンクにする。
+    """
+    message = _TRANSLATE_LINK_RE.sub(r"<\1|翻訳で読む>", message)
     return message.replace("**", "*")
 
 
 def to_plain_format(message):
-    """汎用 Webhook 向けに、Markdown の太字記号を外したプレーンな文にする。"""
+    """汎用 Webhook 向けに、Markdown の太字記号を外したプレーンな文にする。
+
+    マスクリンクは使えないので、翻訳リンクは URL のまま残す。
+    """
     return message.replace("**", "")
 
 
