@@ -1,0 +1,9 @@
+{
+  "app_ids": [1234560],
+  "discord_webhook_url": "https://discord.com/api/webhooks/ここにDiscordのWebhook URL（使う場合）",
+  "slack_webhook_url": "",
+  "webhook_url": "",
+  "fetch_count": 20,
+  "interval_minutes": 30,
+  "state_file": "state.json"
+}
