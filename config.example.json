@@ -10,7 +10,7 @@
   "state_file": "state.json",
   "translate_link": true,
   "label_alert": {
-    "enabled": true,
+    "enabled": false,
     "warn_within": 5
   },
   "analytics": {
@@ -37,9 +37,12 @@
       "cooldown_hours": 24
     },
     "fatal_alerts": {
-      "enabled": true,
+      "enabled": false,
       "extra_keywords": [],
       "per_app_keywords": {}
+    },
+    "histogram": {
+      "enabled": true
     },
     "topics": {
       "enabled": true,

@@ -39,6 +39,7 @@ STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
 STEAM_NEWS_URL = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/"
 STEAM_PLAYERS_URL = "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
 STEAM_ACHIEVEMENTS_URL = "https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/"
+STEAM_HISTOGRAM_URL = "https://store.steampowered.com/appreviewhistogram"
 USER_AGENT = "Koebin/0.2 (+https://x.com/axioknot_jp)"
 
 PENDING_KEY = "__pending__"  # state.json 内で「送信に失敗して再送待ち」のレビューを置くキー
@@ -82,6 +83,7 @@ try:
         backfill_history,
         detect_sale_event,
         evaluate_and_alert,
+        import_review_histogram,
         match_fatal_keyword,
         open_store,
         sync_feed_events,
@@ -92,6 +94,7 @@ except Exception:
     backfill_history = None
     detect_sale_event = None
     evaluate_and_alert = None
+    import_review_histogram = None
     match_fatal_keyword = None
     open_store = None
     sync_feed_events = None
@@ -327,6 +330,30 @@ def fetch_app_metadata(appid, base_url=None):
         return None
 
 
+def fetch_review_histogram(appid, base_url=None):
+    """レビュー件数の推移（ヒストグラム）から rollups を取る。失敗時は None。
+
+    store.steampowered.com/appreviewhistogram/<appid> が返す月次（粒度は
+    タイトル・期間で変わり得る）の集計で、各要素に date（UNIX時刻）と
+    recommendations_up / recommendations_down が入る。レビュー個別の
+    データではなく、件数の集計だけが返る。
+    このエンドポイントは公式ドキュメントに載らない非公式寄りのもので、
+    仕様が変わり得るため、取れなくても本体は止めない前提で扱う。
+    """
+    try:
+        base = (base_url or STEAM_HISTOGRAM_URL).rstrip("/")
+        data = http_get_json("{}/{}".format(base, appid), {"l": "english"})
+        if int(data.get("success", 0) or 0) != 1:
+            return None
+        results = data.get("results")
+        if not isinstance(results, dict):
+            return None
+        rollups = results.get("rollups")
+        return rollups if isinstance(rollups, list) else None
+    except Exception:
+        return None
+
+
 def fetch_global_achievements(appid, base_url=None):
     """実績の全体達成率（全実績の name / percent のリスト）を取る。失敗時は None。"""
     try:
@@ -466,7 +493,9 @@ def _maybe_label_alert(config, state, appid, app_name, notify, base_url=None,
     同じ状況（ラベルと残り件数の組）では繰り返し送らない。
     """
     cfg = config.get("label_alert", {}) or {}
-    if cfg.get("enabled", True) is False:
+    # 評価ラベルの陥落アラートは初期状態では無効（目安の計算がずれて
+    # 誤報になる可能性があるため）。使う場合は label_alert.enabled を true にする
+    if cfg.get("enabled", False) is not True:
         return
     try:
         warn_within = int(cfg.get("warn_within", 5))
@@ -562,9 +591,13 @@ def format_fatal_message(app_name, appid, review, keyword):
 
 
 def _fatal_alerts_cfg(config):
-    """致命語アラートの設定を返す。無効なら None。"""
+    """致命語アラートの設定を返す。無効なら None。
+
+    初期状態では無効（キーワード一致ベースで誤報があり得るため）。
+    analytics.fatal_alerts.enabled が明示的に true の場合だけ有効になる。
+    """
     cfg = (config.get("analytics", {}) or {}).get("fatal_alerts", {}) or {}
-    if cfg.get("enabled", True) is False:
+    if cfg.get("enabled", False) is not True:
         return None
     return cfg
 
@@ -725,6 +758,40 @@ def _maybe_backfill(config, store, appid):
             )
     except Exception as e:
         print("[警告] appid={} の過去分取り込みに失敗しました: {}".format(appid, e), file=sys.stderr)
+
+
+def _maybe_histogram(config, store, appid):
+    """未実施なら月次集計（ヒストグラム）の取り込みを1回だけ行う。
+
+    バックフィルと同時に初回だけ自動実行する。取得に失敗しても記録だけ残し、
+    本体は止めない（手動の import-history --force でやり直せる）。
+    """
+    if store is None or import_review_histogram is None:
+        return
+    hist_cfg = (config.get("analytics", {}) or {}).get("histogram", {}) or {}
+    if hist_cfg.get("enabled", True) is False:
+        return
+    try:
+        if store.get_meta("histogram:{}".format(appid)) is not None:
+            return
+        rollups = fetch_review_histogram(
+            appid, base_url=config.get("_histogram_base_url")
+        )
+        result = import_review_histogram(store, appid, rollups)
+        if result.get("status") == "imported":
+            print(
+                "[月次集計取り込み] appid={}: {}か月分を取り込みました".format(
+                    appid, result.get("months", 0)
+                )
+            )
+        elif result.get("status") == "failed":
+            print(
+                "[警告] appid={} の月次集計の取得に失敗しました"
+                "（import-history --force で再実行できます）".format(appid),
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print("[警告] appid={} の月次集計取り込みに失敗しました: {}".format(appid, e), file=sys.stderr)
 
 
 def _maybe_snapshots(config, store, appid, base_url=None):
@@ -1019,6 +1086,7 @@ def check_once(config, state_path, notify, store=None):
             except Exception as e:
                 print("[警告] appid={} の履歴保存に失敗しました: {}".format(appid, e), file=sys.stderr)
             _maybe_backfill(config, store, appid)
+            _maybe_histogram(config, store, appid)
             _maybe_sync_events(config, store, appid)
             _maybe_sync_app_metadata(config, store, appid)
             _maybe_achievements(config, store, appid)

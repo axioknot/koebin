@@ -14,7 +14,9 @@
 - そのほか、公開APIで取れる情報は保存を優先する（時系列は後から取れないため）：
   レビューは全フィールド＋生JSON、チェック時点のスナップショット
   （公式の総数・評価ラベル・同時プレイヤー数・割引率）、割引の開始/終了の
-  イベント自動登録、アプリ基本情報（変更時のみ）、実績の全体達成率（週1回）
+  イベント自動登録、アプリ基本情報（変更時のみ）、実績の全体達成率（週1回）、
+  レビュー件数の月次集計（ヒストグラム。初回に過去分を取り込み、
+  ダイジェストの長期傾向に使う）
 
 - 依存ライブラリなし（Python 3.9+ 標準ライブラリのみ、sqlite3 を含む）
 - 通知ツールから import して使うほか、単体でも実行できる：
@@ -22,6 +24,7 @@
     python steam_review_analytics.py --config config.json digest --dry-run（表示のみ）
     python steam_review_analytics.py --config config.json check-surge   （急増検知のみ）
     python steam_review_analytics.py --config config.json backfill      （過去分をさかのぼって取り込む）
+    python steam_review_analytics.py --config config.json import-history（月次集計を取り込む）
     python steam_review_analytics.py --config config.json sync-events   （公式発表からイベント候補を登録）
     python steam_review_analytics.py --config config.json events        （登録済みイベントの一覧）
     python steam_review_analytics.py --config config.json add-event --appid 123 --date 2026-11-15 --title "大型アップデート"
@@ -86,7 +89,9 @@ def language_name(code):
 # 誤検知・見逃しがあり得ることを前提に、辞書は config で追加できるようにしている。
 
 DEFAULT_FATAL = {
-    "enabled": True,
+    # 致命語の即時通知は初期状態では無効（誤報の可能性があるため）。
+    # 使う場合は config の analytics.fatal_alerts.enabled を true にする
+    "enabled": False,
     # 致命語の初期辞書（日英中）。config の analytics.fatal_alerts.extra_keywords と
     # per_app_keywords（appid ごとの追加）で足せる
     "keywords": [
@@ -201,10 +206,14 @@ def resolve_fatal_keywords(cfg=None, appid=None):
 
 
 def match_fatal_keyword(text, cfg=None, appid=None):
-    """レビュー本文に致命語が含まれれば、そのキーワードを返す。"""
+    """レビュー本文に致命語が含まれれば、そのキーワードを返す。
+
+    初期状態では無効（enabled の既定値は False）。config で明示的に
+    有効化された場合だけ照合する。
+    """
     merged = dict(DEFAULT_FATAL)
     merged.update(cfg or {})
-    if not merged.get("enabled", True):
+    if not merged.get("enabled", False):
         return None
     return find_keyword_hit(text, resolve_fatal_keywords(cfg, appid))
 
@@ -351,6 +360,14 @@ class ReviewStore:
                 ts INTEGER NOT NULL,
                 data_json TEXT NOT NULL,
                 PRIMARY KEY (appid, ts)
+            );
+            CREATE TABLE IF NOT EXISTS monthly_review_stats (
+                appid TEXT NOT NULL,
+                year_month TEXT NOT NULL,
+                recommendations_up INTEGER NOT NULL DEFAULT 0,
+                recommendations_down INTEGER NOT NULL DEFAULT 0,
+                imported_at INTEGER,
+                PRIMARY KEY (appid, year_month)
             );
             """
         )
@@ -545,6 +562,59 @@ class ReviewStore:
     def count_reviews(self, appid):
         row = self.conn.execute(
             "SELECT COUNT(*) AS c FROM reviews WHERE appid = ?", (str(appid),)
+        ).fetchone()
+        return row["c"]
+
+    def upsert_monthly_stats(self, appid, monthly, now=None):
+        """月次集計（{"YYYY-MM": {"up": n, "down": n}}）を保存する。
+
+        主キーは appid × 年月のため、再取り込みしても重複しない（値は上書き）。
+        保存した月数を返す。
+        """
+        now = int(now if now is not None else time.time())
+        saved = 0
+        for year_month, counts in (monthly or {}).items():
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO monthly_review_stats (
+                    appid, year_month, recommendations_up, recommendations_down,
+                    imported_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(appid), str(year_month),
+                    int(counts.get("up", 0) or 0),
+                    int(counts.get("down", 0) or 0),
+                    now,
+                ),
+            )
+            saved += 1
+        self.conn.commit()
+        return saved
+
+    def monthly_stats(self, appid, limit=12):
+        """直近 limit か月分の月次集計を、古い月から新しい月の順で返す。"""
+        rows = self.conn.execute(
+            """
+            SELECT year_month, recommendations_up, recommendations_down
+            FROM monthly_review_stats WHERE appid = ?
+            ORDER BY year_month DESC LIMIT ?
+            """,
+            (str(appid), int(limit)),
+        ).fetchall()
+        return [
+            {
+                "year_month": r["year_month"],
+                "up": r["recommendations_up"],
+                "down": r["recommendations_down"],
+            }
+            for r in reversed(rows)
+        ]
+
+    def count_monthly_stats(self, appid):
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM monthly_review_stats WHERE appid = ?",
+            (str(appid),),
         ).fetchone()
         return row["c"]
 
@@ -746,6 +816,9 @@ def build_digest_text(store, appid, app_name, now=None, days=7, config=None):
             )
         )
         lines.extend(
+            build_longterm_lines(store, appid, cfg=analytics_cfg.get("histogram"))
+        )
+        lines.extend(
             build_event_comparison_lines(
                 store, appid, now=now, days=days, cfg=analytics_cfg.get("events")
             )
@@ -778,6 +851,10 @@ def build_digest_text(store, appid, app_name, now=None, days=7, config=None):
         build_player_lines(
             store, appid, now=now, days=days, cfg=analytics_cfg.get("players")
         )
+    )
+    # 長期の傾向（月次集計を取り込んだタイトルだけ）
+    lines.extend(
+        build_longterm_lines(store, appid, cfg=analytics_cfg.get("histogram"))
     )
 
     top = [r for r in cur["top_reviews"] if int(r.get("votes_up", 0) or 0) > 0][:3]
@@ -1069,6 +1146,84 @@ def backfill_history(store, appid, fetch_page, cfg=None, now=None, sleep=None):
     return {"status": status, "fetched": fetched, "reason": reason, "pages": pages}
 
 
+DEFAULT_HISTOGRAM = {
+    "enabled": True,  # 月次集計（ヒストグラム）の取り込みと長期傾向の表示を使うか
+}
+
+
+def aggregate_rollups_by_month(rollups):
+    """ヒストグラムの rollups を {"YYYY-MM": {"up": n, "down": n}} に月単位で集計する。
+
+    rollups の粒度はタイトルや期間で変わり得る（月次とは限らない）ため、
+    date（UTC）の年月でまとめて合計する。
+    """
+    monthly = {}
+    for item in rollups or []:
+        try:
+            ts = int(item.get("date", 0) or 0)
+            up = int(item.get("recommendations_up", 0) or 0)
+            down = int(item.get("recommendations_down", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if ts <= 0:
+            continue
+        key = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
+        bucket = monthly.setdefault(key, {"up": 0, "down": 0})
+        bucket["up"] += up
+        bucket["down"] += down
+    return monthly
+
+
+def import_review_histogram(store, appid, rollups, now=None):
+    """ヒストグラムの月次集計を取り込んで保存する。
+
+    取り込むのは月ごとの件数集計だけで、レビュー個別のデータは含まない。
+    実施結果は meta の `histogram:<appid>` に記録し、通知ツール側はこの記録が
+    ある限り自動では再実行しない（手動の import-history --force でやり直せる）。
+    rollups が None（取得失敗）の場合も失敗として記録し、例外は投げない。
+    戻り値: {"status": "imported"|"empty"|"failed", "months": int}
+    """
+    now = int(now if now is not None else time.time())
+    if rollups is None:
+        status, months = "failed", 0
+    else:
+        monthly = aggregate_rollups_by_month(rollups)
+        months = store.upsert_monthly_stats(appid, monthly, now=now) if monthly else 0
+        status = "imported" if months else "empty"
+    store.set_meta(
+        "histogram:{}".format(appid),
+        json.dumps({"status": status, "months": months, "at": now}, ensure_ascii=False),
+    )
+    return {"status": status, "months": months}
+
+
+def build_longterm_lines(store, appid, cfg=None):
+    """ダイジェスト用の「長期の傾向」行。月次集計が無いタイトルでは出さない。
+
+    蓄積したレビュー履歴が浅い期間の補完として、取り込んだ月次集計から
+    直近12か月の月平均件数とおすすめ率を出す。
+    """
+    merged = {**DEFAULT_HISTOGRAM, **(cfg or {})}
+    if not merged.get("enabled", True):
+        return []
+    rows = store.monthly_stats(appid, limit=12)
+    if not rows:
+        return []
+    total_up = sum(r["up"] for r in rows)
+    total_down = sum(r["down"] for r in rows)
+    total = total_up + total_down
+    if total <= 0:
+        return []
+    months = len(rows)
+    avg = total / months
+    avg_txt = "{:.0f}".format(avg) if avg >= 10 else "{:.1f}".format(avg)
+    return [
+        "長期の傾向：直近{}か月の月平均 {}件｜おすすめ率 {:.0f}%".format(
+            months, avg_txt, total_up / total * 100
+        )
+    ]
+
+
 DEFAULT_EVENTS = {
     "enabled": True,  # 公式発表からのイベント候補の抽出・前後比較を使うか
     # タイトルに含まれていたらイベント候補にするキーワード（小文字で比較）
@@ -1199,12 +1354,12 @@ def main():
     parser.add_argument("--config", default="config.json", help="設定ファイルのパス")
     parser.add_argument(
         "command",
-        choices=["digest", "check-surge", "backfill", "sync-events", "events",
-                 "add-event", "remove-event"],
+        choices=["digest", "check-surge", "backfill", "import-history",
+                 "sync-events", "events", "add-event", "remove-event"],
         help="実行する処理",
     )
     parser.add_argument("--dry-run", action="store_true", help="送信せず標準出力に表示する")
-    parser.add_argument("--force", action="store_true", help="backfill を実施済みでも再実行する")
+    parser.add_argument("--force", action="store_true", help="backfill / import-history を実施済みでも再実行する")
     parser.add_argument("--appid", help="add-event / remove-event の対象タイトル")
     parser.add_argument("--date", help="add-event の日付（YYYY-MM-DD）")
     parser.add_argument("--title", help="add-event のイベント名")
@@ -1222,6 +1377,7 @@ def main():
         build_notifier,
         fetch_announcements,
         fetch_app_name,
+        fetch_review_histogram,
         fetch_reviews_page,
     )
 
@@ -1306,6 +1462,36 @@ def main():
                     "appid={}: {}（{}件{}）".format(
                         appid, result["status"], result["fetched"],
                         "、理由: " + result["reason"] if result["reason"] else "",
+                    )
+                )
+        finally:
+            store.close()
+        return 0
+
+    if args.command == "import-history":
+        store = open_store(config, config_path.parent)
+        try:
+            hist_cfg = (config.get("analytics", {}) or {}).get("histogram")
+            merged = {**DEFAULT_HISTOGRAM, **(hist_cfg or {})}
+            if not merged.get("enabled", True):
+                print("月次集計の取り込みは無効化されています（analytics.histogram.enabled）")
+                return 0
+            for appid in config.get("app_ids", []):
+                appid = str(appid)
+                key = "histogram:{}".format(appid)
+                if not args.force and store.get_meta(key) is not None:
+                    print("appid={}: 実施済みのためスキップしました（--force で再実行）".format(appid))
+                    continue
+                if args.force:
+                    store.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+                    store.conn.commit()
+                rollups = fetch_review_histogram(
+                    appid, base_url=config.get("_histogram_base_url")
+                )
+                result = import_review_histogram(store, appid, rollups)
+                print(
+                    "appid={}: {}（{}か月分）".format(
+                        appid, result["status"], result["months"]
                     )
                 )
         finally:
