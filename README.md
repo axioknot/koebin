@@ -21,7 +21,10 @@ by Axioknot
 2. `config.example.json` を `config.json` という名前でコピーします
 3. `config.json` を編集します
    - `app_ids`: 監視したいゲームのApp ID（SteamのストアURL `store.steampowered.com/app/<この数字>/` の数字です）
-   - 通知先（いずれか1つ以上）：`discord_webhook_url`（Discordの「サーバー設定 → 連携サービス → ウェブフック」で発行）、`slack_webhook_url`（SlackのIncoming Webhook）、`webhook_url`（任意のWebhookへ `{"text": ...}` 形式で送信）
+   - 通知先（いずれか1つ以上を設定します）
+     - `discord_webhook_url`: Discordの「サーバー設定 → 連携サービス → ウェブフック」で発行したURL
+     - `slack_webhook_url`: SlackのIncoming WebhookのURL
+     - `webhook_url`: 任意のWebhookのURL（`{"text": ...}` 形式で送ります）
    - `interval_minutes`: `--loop` 実行時のチェック間隔（分）。初期値は30分です
 4. 実行します
 
