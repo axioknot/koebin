@@ -76,6 +76,87 @@ def language_name(code):
     return LANGUAGE_NAMES.get(code or "", code or "不明")
 
 
+# Steamの言語コード → ISO 639-1（ローカル機械翻訳 Argos Translate 用）
+STEAM_TO_ISO = {
+    "japanese": "ja",
+    "english": "en",
+    "schinese": "zh",
+    "tchinese": "zh",
+    "koreana": "ko",
+    "spanish": "es",
+    "latam": "es",
+    "french": "fr",
+    "german": "de",
+    "russian": "ru",
+    "portuguese": "pt",
+    "brazilian": "pt",
+    "thai": "th",
+    "vietnamese": "vi",
+    "indonesian": "id",
+    "italian": "it",
+    "polish": "pl",
+    "turkish": "tr",
+    "ukrainian": "uk",
+    "dutch": "nl",
+}
+
+
+def build_translator(config):
+    """任意機能：ローカル機械翻訳（Argos Translate）の呼び出し口を作る。
+
+    config の translate_display が true のときだけ有効になる。
+    argostranslate が入っていない、言語パッケージが無い、翻訳に失敗した、
+    のいずれでも None を返し、通知は従来どおり（原文＋翻訳リンク）で届く。
+    翻訳は利用者のPCの中で行い、外部に本文を送らない。
+    """
+    if not config.get("translate_display"):
+        return None
+    target = config.get("translate_target") or "ja"
+    try:
+        import argostranslate.translate as _argos_translate
+    except Exception:
+        print("[情報] translate_display が有効ですが argostranslate が見つかりません。"
+              "翻訳リンクで代用します", file=sys.stderr)
+        return None
+    cache = {}
+
+    def _get(from_code, to_code):
+        key = (from_code, to_code)
+        if key not in cache:
+            try:
+                cache[key] = _argos_translate.get_translation_from_codes(
+                    from_code, to_code
+                )
+            except Exception:
+                cache[key] = None
+        return cache[key]
+
+    def translate(text, steam_language):
+        from_code = STEAM_TO_ISO.get(steam_language or "")
+        if not from_code or from_code == target or not text:
+            return None
+        try:
+            direct = _get(from_code, target)
+            if direct is not None:
+                result = direct.translate(text)
+                return result.strip() if result else None
+            # Argos の言語パッケージは日本語への直接変換が英語からしか無い
+            # （2026-11 時点の公式索引で確認）。無い場合は英語を経由する。
+            if target != "en":
+                leg1 = _get(from_code, "en")
+                leg2 = _get("en", target)
+                if leg1 is not None and leg2 is not None:
+                    mid = leg1.translate(text)
+                    if mid:
+                        result = leg2.translate(mid)
+                        return result.strip() if result else None
+            return None
+        except Exception:
+            return None
+
+    return translate
+
+
 # 分析層（履歴の蓄積・急増検知・バックフィル）は任意モジュール。無くても通知は動く。
 try:
     from steam_review_analytics import (
@@ -528,7 +609,8 @@ def _maybe_label_alert(config, state, appid, app_name, notify, base_url=None,
         markers[appid] = marker
 
 
-def format_review_message(app_name, appid, review, translate_link=True):
+def format_review_message(app_name, appid, review, translate_link=True,
+                          translator=None):
     author = review.get("author", {}) or {}
     minutes = author.get("playtime_at_review")
     if minutes is None:
@@ -553,12 +635,18 @@ def format_review_message(app_name, appid, review, translate_link=True):
         "**【新着レビュー】{}**".format(app_name),
         "{}｜言語: {}｜プレイ時間: {:.1f}時間｜{}".format(verdict, lang, playtime_h, when),
         text,
-        link,
     ]
-    # 日本語以外のレビューには、機械翻訳ページへのリンクを付ける
+    # 日本語以外のレビュー：任意機能のローカル翻訳が使えれば翻訳文を出す。
+    # 使えない場合は、機械翻訳ページへのリンクを付ける
     # （リンク先は外部サービス。運営側にコストはかからない）
-    if translate_link and (review.get("language") or "") not in ("", "japanese"):
-        raw = (review.get("review") or "").strip()
+    raw = (review.get("review") or "").strip()
+    translated = None
+    if translator is not None and raw:
+        translated = translator(raw[:300], review.get("language") or "")
+    if translated:
+        lines.append("翻訳（機械翻訳）: {}".format(translated.replace("\n", " ")))
+    lines.append(link)
+    if not translated and translate_link and (review.get("language") or "") not in ("", "japanese"):
         if raw:
             snippet = raw[:250]
             turl = (
@@ -1065,6 +1153,7 @@ def check_once(config, state_path, notify, store=None):
     state = load_state(state_path)
     total_notified = 0
     failed_apps = 0
+    translator = build_translator(config)  # 任意機能（未設定・未導入なら None）
     base_url = config.get("_reviews_base_url")  # テスト用に差し替え可能（通常は未設定）
 
     # まず前回の送信失敗分を再送する（取得が失敗しても再送は試みる）
@@ -1138,6 +1227,7 @@ def check_once(config, state_path, notify, store=None):
             msg = format_review_message(
                 app_name, appid, review,
                 translate_link=bool(config.get("translate_link", True)),
+                translator=translator,
             )
             results = deliver(notify, msg)
             failed_dests = [name for name, ok in results.items() if not ok]

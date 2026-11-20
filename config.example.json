@@ -9,6 +9,7 @@
   "interval_minutes": 30,
   "state_file": "state.json",
   "translate_link": true,
+  "translate_display": false,
   "label_alert": {
     "enabled": false,
     "warn_within": 5

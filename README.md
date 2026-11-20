@@ -69,6 +69,29 @@ https://steamcommunity.com/profiles/（投稿者のSteamID）/recommended/（App
 日本語以外のレビューでは、本文の下に「翻訳で読む」リンク（Google翻訳）が付きます。
 リンクを開くとレビュー本文がGoogle翻訳に送られ、翻訳結果が表示されます（外部サービスへのリンクです）。
 付けたくない場合は、`config.json` の `translate_link` を `false` にしてください。
+Discord / Slack では、長いURLは見出し文字の裏に隠れて表示されます。
+
+### 翻訳文の表示（任意機能）
+
+リンクではなく、通知の中に翻訳文そのものを表示することもできます。
+翻訳はOSSの機械翻訳（Argos Translate）をあなたのPCの中で実行します。
+外部サービスに本文を送らず、運営側にもコストはかかりません。
+
+導入手順:
+
+```
+pip install argostranslate
+argospm update
+argospm install translate-en_ja
+```
+
+英語以外の言語（韓国語・中国語など）は、英語を経由して翻訳します。
+対象言語の「英語への変換」パッケージも入れてください（例：韓国語は `translate-ko_en`、中国語は `translate-zh_en`）。
+
+そのうえで、`config.json` に `"translate_display": true` を追加すると、
+日本語以外のレビューの通知に「翻訳（機械翻訳）: …」の行が付きます。
+原文はそのまま残ります（機械翻訳の取り違えを原文で確認できるようにするためです）。
+翻訳が実行できない環境では、自動で従来の翻訳リンク表示に戻ります。
 
 ## 分析層（履歴・週次ダイジェスト・低評価の急増アラート）
 

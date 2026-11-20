@@ -459,3 +459,104 @@ class TestTranslateLinkFormats(unittest.TestCase):
         out = notifier.to_plain_format(self.MSG)
         self.assertIn("翻訳で読む: https://translate.google.com/", out)
         self.assertNotIn("**", out)
+
+
+class TestTranslateDisplay(unittest.TestCase):
+    REVIEW = {
+        "author": {"playtime_at_review": 600, "steamid": "123"},
+        "voted_up": False,
+        "language": "koreana",
+        "review": "이 게임은 정말 재미없어요. 환불하고 싶어요.",
+        "timestamp_created": 1763600000,
+        "recommendationid": "999",
+    }
+
+    def test_translation_shown_and_link_omitted(self):
+        def fake(text, lang):
+            self.assertEqual(lang, "koreana")
+            return "このゲームは本当につまらないです。返金したいです。"
+        out = notifier.format_review_message(
+            "Game", "646570", self.REVIEW, translator=fake)
+        self.assertIn("翻訳（機械翻訳）: このゲームは本当につまらないです", out)
+        self.assertIn("이 게임은 정말 재미없어요", out)  # 原文も残る
+        self.assertNotIn("翻訳で読む", out)  # 翻訳が出たらリンクは付けない
+
+    def test_fallback_to_link_when_translation_fails(self):
+        out = notifier.format_review_message(
+            "Game", "646570", self.REVIEW, translator=lambda t, l: None)
+        self.assertIn("翻訳で読む: https://translate.google.com/", out)
+        self.assertNotIn("翻訳（機械翻訳）", out)
+
+    def test_japanese_review_never_translated(self):
+        review = dict(self.REVIEW, language="japanese", review="面白いです")
+        called = []
+        out = notifier.format_review_message(
+            "Game", "646570", review,
+            translator=lambda t, l: called.append(1) or "訳")
+        # build_translator 側で日本語は弾くが、format 側は translator の
+        # 戻りに従う。ここでは translator が呼ばれても日本語リンクは付かない
+        self.assertNotIn("翻訳で読む", out)
+
+    def test_build_translator_disabled(self):
+        self.assertIsNone(notifier.build_translator({}))
+        self.assertIsNone(notifier.build_translator({"translate_display": False}))
+
+    def test_build_translator_missing_argos(self):
+        # この環境に argostranslate は無いので None（リンクで代用）になる
+        self.assertIsNone(notifier.build_translator({"translate_display": True}))
+
+    def test_steam_to_iso_mapping(self):
+        self.assertEqual(notifier.STEAM_TO_ISO["koreana"], "ko")
+        self.assertEqual(notifier.STEAM_TO_ISO["schinese"], "zh")
+        self.assertEqual(notifier.STEAM_TO_ISO["japanese"], "ja")
+
+
+class TestBuildTranslatorWithFakeArgos(unittest.TestCase):
+    def setUp(self):
+        import types
+        self.calls = []
+        calls = self.calls
+
+        class FakeTranslation:
+            def __init__(self, tag):
+                self.tag = tag
+
+            def translate(self, text):
+                return self.tag + text
+
+        def fake_from_codes(frm, to):
+            calls.append((frm, to))
+            if (frm, to) == ("en", "ja"):
+                return FakeTranslation("訳文：")
+            if (frm, to) == ("ko", "ja"):
+                return None  # 日本語への直接パッケージは無い（実索引どおり）
+            return FakeTranslation("EN:")
+
+        pkg = types.ModuleType("argostranslate")
+        tr = types.ModuleType("argostranslate.translate")
+        tr.get_translation_from_codes = fake_from_codes
+        pkg.translate = tr
+        self._saved = {k: sys.modules.get(k) for k in ("argostranslate", "argostranslate.translate")}
+        sys.modules["argostranslate"] = pkg
+        sys.modules["argostranslate.translate"] = tr
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    def test_translates_korean_to_ja(self):
+        tr = notifier.build_translator({"translate_display": True})
+        self.assertIsNotNone(tr)
+        # 直接パッケージが無いので英語経由（ko→en→ja）になる
+        self.assertEqual(tr("원문", "koreana"), "訳文：EN:원문")
+        self.assertEqual(
+            self.calls, [("ko", "ja"), ("ko", "en"), ("en", "ja")])
+
+    def test_skips_japanese_and_unknown(self):
+        tr = notifier.build_translator({"translate_display": True})
+        self.assertIsNone(tr("原文", "japanese"))
+        self.assertIsNone(tr("text", "klingon"))
+        self.assertEqual(self.calls, [])
