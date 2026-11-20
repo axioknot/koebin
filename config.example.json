@@ -8,6 +8,11 @@
   "fetch_count": 20,
   "interval_minutes": 30,
   "state_file": "state.json",
+  "translate_link": true,
+  "label_alert": {
+    "enabled": true,
+    "warn_within": 5
+  },
   "analytics": {
     "enabled": true,
     "db_file": "reviews.db",
@@ -30,6 +35,29 @@
       "ratio_delta": 0.2,
       "ratio_floor": 0.3,
       "cooldown_hours": 24
+    },
+    "fatal_alerts": {
+      "enabled": true,
+      "extra_keywords": [],
+      "per_app_keywords": {}
+    },
+    "topics": {
+      "enabled": true,
+      "extra_keywords": {},
+      "per_app_keywords": {}
+    },
+    "sale_events": {
+      "enabled": true
+    },
+    "players": {
+      "enabled": true
+    },
+    "metadata": {
+      "enabled": true
+    },
+    "achievements": {
+      "enabled": true,
+      "interval_days": 7
     }
   }
 }

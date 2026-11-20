@@ -11,6 +11,9 @@
 - 通知の送信に失敗したレビューは既読にせず、次回実行時に失敗した送信先へだけ再送します
 - 状態は state.json に保存されます（書き込みは一時ファイル経由で原子的に行います）
 - Steamの公開レビューAPI（IUserReviewsService/GetAppReviews）を使うため、APIキーは不要です
+- 分析層（steam_review_analytics.py）と併用すると、履歴の蓄積・週次ダイジェスト・
+  低評価の急増アラートに加え、致命語の即時アラート、評価ラベルの目安アラート、
+  セール開始/終了の自動記録、同時プレイヤー数の記録などが使えます
 
 使い方:
   1. config.example.json を config.json にコピーして編集する
@@ -21,6 +24,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -33,6 +37,8 @@ from pathlib import Path
 STEAM_REVIEWS_URL = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/"
 STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
 STEAM_NEWS_URL = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/"
+STEAM_PLAYERS_URL = "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+STEAM_ACHIEVEMENTS_URL = "https://api.steampowered.com/ISteamUserStats/GetGlobalAchievementPercentagesForApp/v2/"
 USER_AGENT = "Koebin/0.2 (+https://x.com/axioknot_jp)"
 
 PENDING_KEY = "__pending__"  # state.json 内で「送信に失敗して再送待ち」のレビューを置くキー
@@ -74,7 +80,9 @@ try:
         DEFAULT_EVENTS,
         ReviewStore,
         backfill_history,
+        detect_sale_event,
         evaluate_and_alert,
+        match_fatal_keyword,
         open_store,
         sync_feed_events,
     )
@@ -82,7 +90,9 @@ except Exception:
     DEFAULT_EVENTS = {}
     ReviewStore = None
     backfill_history = None
+    detect_sale_event = None
     evaluate_and_alert = None
+    match_fatal_keyword = None
     open_store = None
     sync_feed_events = None
 
@@ -221,7 +231,274 @@ def fetch_reviews_until(appid, known_ids=None, page_size=20, max_pages=MAX_FETCH
     return reviews, caught_up
 
 
-def format_review_message(app_name, appid, review):
+def fetch_query_summary(appid, base_url=None):
+    """query_summary（総レビュー数・おすすめ数・公式の評価ラベル等）を取る。失敗時は None。
+
+    レビュー取得と同じエンドポイントに num_per_page=1 で問い合わせる。
+    """
+    try:
+        url = base_url or STEAM_REVIEWS_URL
+        input_json = json.dumps(
+            {
+                "appid": appid,
+                "filter": 1,
+                "languages": ["all"],
+                "purchase_type": 1,
+                "num_per_page": 1,
+                "cursor": "*",
+            }
+        )
+        data = http_get_json(url, {"input_json": input_json})
+        body = data.get("response", data)
+        if not isinstance(body, dict):
+            return None
+        qs = body.get("query_summary")
+        return qs if isinstance(qs, dict) else None
+    except Exception:
+        return None
+
+
+def fetch_discount_percent(appid, base_url=None):
+    """appdetails（filters=price_overview, cc=jp）から割引率（%）を取る。
+
+    無料ゲームなど price_overview が無い場合や取得失敗時は None
+    （「割引なし＝0%」と区別するため）。
+    """
+    try:
+        url = base_url or STEAM_APPDETAILS_URL
+        data = http_get_json(
+            url, {"appids": appid, "filters": "price_overview", "cc": "jp"}
+        )
+        entry = data.get(str(appid), {})
+        if not entry.get("success"):
+            return None
+        overview = (entry.get("data") or {}).get("price_overview")
+        if not isinstance(overview, dict):
+            return None
+        return int(overview.get("discount_percent", 0) or 0)
+    except Exception:
+        return None
+
+
+def fetch_current_players(appid, base_url=None):
+    """同時プレイヤー数の現在値を取る（キー不要）。失敗時は None。"""
+    try:
+        url = base_url or STEAM_PLAYERS_URL
+        data = http_get_json(url, {"appid": appid})
+        resp = data.get("response", {})
+        if int(resp.get("result", 0) or 0) != 1:
+            return None
+        return int(resp.get("player_count", 0) or 0)
+    except Exception:
+        return None
+
+
+def fetch_app_metadata(appid, base_url=None):
+    """appdetails の基本情報を、履歴保存用に要約した辞書で取る。失敗時は None。"""
+    try:
+        url = base_url or STEAM_APPDETAILS_URL
+        data = http_get_json(url, {"appids": appid, "l": "japanese"})
+        entry = data.get(str(appid), {})
+        if not entry.get("success"):
+            return None
+        d = entry.get("data") or {}
+        po = d.get("price_overview") or {}
+        return {
+            "name": d.get("name"),
+            "developers": d.get("developers") or [],
+            "publishers": d.get("publishers") or [],
+            "genres": [g.get("description") for g in d.get("genres") or []],
+            "categories": [c.get("description") for c in d.get("categories") or []],
+            "release_date": (d.get("release_date") or {}).get("date"),
+            "supported_languages": d.get("supported_languages"),
+            "price": (
+                {
+                    "currency": po.get("currency"),
+                    "initial": po.get("initial"),
+                    "final": po.get("final"),
+                    "discount_percent": po.get("discount_percent"),
+                }
+                if po else None
+            ),
+            "metacritic": (d.get("metacritic") or {}).get("score"),
+            "recommendations": (d.get("recommendations") or {}).get("total"),
+        }
+    except Exception:
+        return None
+
+
+def fetch_global_achievements(appid, base_url=None):
+    """実績の全体達成率（全実績の name / percent のリスト）を取る。失敗時は None。"""
+    try:
+        url = base_url or STEAM_ACHIEVEMENTS_URL
+        data = http_get_json(url, {"gameid": appid})
+        achievements = (data.get("achievementpercentages") or {}).get("achievements")
+        return achievements if isinstance(achievements, list) else None
+    except Exception:
+        return None
+
+
+# ===== 評価ラベルの目安と陥落アラート =====
+# Steam の表示ラベルは、キー経由レビューの除外など細かい仕様で決まるため、
+# ここでの計算はすべて「目安」。公式ラベル（query_summary.review_score_desc）が
+# 取れた場合は、その帯域の下限（おすすめ率）を使って残り件数を計算する。
+# 帯域の下限は Steamworks ドキュメントに公開されているレビュースコアの
+# 一般的な目安（圧倒的に好評=95%、非常に好評/好評=80%、やや好評=70%、
+# 賛否両論=40%、やや不評=20%）に基づく。
+
+OFFICIAL_LABEL_FLOORS = {
+    "Overwhelmingly Positive": 0.95,
+    "Very Positive": 0.80,
+    "Positive": 0.80,
+    "Mostly Positive": 0.70,
+    "Mixed": 0.40,
+    "Mostly Negative": 0.20,
+    "Negative": 0.0,
+    "Very Negative": 0.0,
+    "Overwhelmingly Negative": 0.0,
+}
+
+OFFICIAL_LABEL_JA = {
+    "Overwhelmingly Positive": "圧倒的に好評",
+    "Very Positive": "非常に好評",
+    "Positive": "好評",
+    "Mostly Positive": "やや好評",
+    "Mixed": "賛否両論",
+    "Mostly Negative": "やや不評",
+    "Negative": "不評",
+    "Very Negative": "非常に不評",
+    "Overwhelmingly Negative": "圧倒的に不評",
+}
+
+
+def estimate_review_label(total, positive):
+    """総件数とおすすめ数から表示ラベルの目安を (ラベル名, 帯域のおすすめ率の下限) で返す。
+
+    レビューが10件未満では Steam はラベルを表示しないため None。
+    """
+    if not total or total < 10:
+        return None
+    ratio = positive / total
+    if ratio >= 0.80:
+        if ratio >= 0.95 and total >= 500:
+            return ("圧倒的に好評", 0.95)
+        if total >= 50:
+            return ("非常に好評", 0.80)
+        return ("好評", 0.80)
+    if ratio >= 0.70:
+        return ("やや好評", 0.70)
+    if ratio >= 0.40:
+        return ("賛否両論", 0.40)
+    if ratio >= 0.20:
+        return ("やや不評", 0.20)
+    if total >= 500:
+        return ("圧倒的に不評", 0.0)
+    if total >= 50:
+        return ("非常に不評", 0.0)
+    return ("不評", 0.0)
+
+
+def negatives_until_label_drop(total, positive, official_desc=None):
+    """あと何件の低評価で評価ラベルが下がるか（目安）を計算する。
+
+    公式ラベルがあればその帯域の下限を使い、無ければ総数とおすすめ率から推定する。
+    計算できない・下限が0の帯域なら None。戻り値は根拠を含む辞書。
+    """
+    if not total:
+        return None
+    label = None
+    floor = None
+    if official_desc and official_desc in OFFICIAL_LABEL_FLOORS:
+        floor = OFFICIAL_LABEL_FLOORS[official_desc]
+        label = OFFICIAL_LABEL_JA[official_desc]
+    else:
+        est = estimate_review_label(total, positive)
+        if est is None:
+            return None
+        label, floor = est
+    if floor <= 0:
+        return None
+    # positive / (total + n) < floor となる最小の n
+    n = int(math.floor(positive / floor - total)) + 1
+    if n < 1:
+        return None
+    new_est = estimate_review_label(total + n, positive)
+    next_label = new_est[0] if new_est else None
+    if next_label is None or next_label == label:
+        return None
+    return {
+        "count": n,
+        "current_label": label,
+        "next_label": next_label,
+        "floor": floor,
+        "total": total,
+        "positive": positive,
+        "official_desc": official_desc,
+    }
+
+
+def format_label_alert(app_name, appid, info):
+    name = app_name or "App {}".format(appid)
+    if info.get("official_desc"):
+        first = "Steam公式の評価ラベルは「{}」です。".format(info["current_label"])
+    else:
+        first = "評価ラベルの目安は「{}」です。".format(info["current_label"])
+    lines = [
+        "⚠【評価ラベルの目安】{}".format(name),
+        "{}あと低評価{}件で、おすすめ率が目安の{:.0f}%を下回り、"
+        "「{}」へ下がる可能性があります（目安）".format(
+            first, info["count"], info["floor"] * 100, info["next_label"]
+        ),
+        "現在の合計：{}件（おすすめ {}件）".format(info["total"], info["positive"]),
+        "※Steamのラベルはキー経由レビューの扱いなど細かい仕様で決まるため、この件数は目安です",
+        "https://store.steampowered.com/app/{}/".format(appid),
+    ]
+    return "\n".join(lines)
+
+
+LABEL_ALERT_KEY = "__label_alert__"  # state.json 内の重複防止マーカー置き場
+
+
+def _maybe_label_alert(config, state, appid, app_name, notify, base_url=None,
+                       query_summary=None):
+    """評価ラベルが下がるまでの残り件数が少なくなったら知らせる（目安）。
+
+    同じ状況（ラベルと残り件数の組）では繰り返し送らない。
+    """
+    cfg = config.get("label_alert", {}) or {}
+    if cfg.get("enabled", True) is False:
+        return
+    try:
+        warn_within = int(cfg.get("warn_within", 5))
+    except (TypeError, ValueError):
+        warn_within = 5
+    qs = query_summary
+    if qs is None:
+        qs = fetch_query_summary(appid, base_url=base_url)
+    if not qs:
+        return
+    try:
+        total = int(qs.get("total_reviews", 0) or 0)
+        positive = int(qs.get("total_positive", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    info = negatives_until_label_drop(total, positive, qs.get("review_score_desc"))
+    markers = state.setdefault(LABEL_ALERT_KEY, {})
+    if info is None or info["count"] > warn_within:
+        markers.pop(appid, None)
+        return
+    marker = "{}:{}".format(info["current_label"], info["count"])
+    if markers.get(appid) == marker:
+        return
+    name = app_name or fetch_app_name(
+        appid, base_url=config.get("_appdetails_base_url")
+    )
+    results = deliver(notify, format_label_alert(name, appid, info))
+    if results and any(results.values()):
+        markers[appid] = marker
+
+
+def format_review_message(app_name, appid, review, translate_link=True):
     author = review.get("author", {}) or {}
     minutes = author.get("playtime_at_review")
     if minutes is None:
@@ -248,7 +525,48 @@ def format_review_message(app_name, appid, review):
         text,
         link,
     ]
+    # 日本語以外のレビューには、機械翻訳ページへのリンクを付ける
+    # （リンク先は外部サービス。運営側にコストはかからない）
+    if translate_link and (review.get("language") or "") not in ("", "japanese"):
+        raw = (review.get("review") or "").strip()
+        if raw:
+            snippet = raw[:250]
+            turl = (
+                "https://translate.google.com/?sl=auto&tl=ja&text={}&op=translate"
+                .format(urllib.parse.quote(snippet))
+            )
+            lines.append("翻訳で読む: {}".format(turl))
     return "\n".join(lines)
+
+
+def format_fatal_message(app_name, appid, review, keyword):
+    """致命語を含むレビューの即時アラート文。"""
+    author = review.get("author", {}) or {}
+    verdict = "👍 おすすめ" if review.get("voted_up") else "👎 おすすめしない"
+    text = (review.get("review") or "").strip().replace("\n", " ")
+    if len(text) > 200:
+        text = text[:200] + "…"
+    steamid = author.get("steamid")
+    if steamid:
+        link = "https://steamcommunity.com/profiles/{}/recommended/{}/".format(steamid, appid)
+    else:
+        link = "https://store.steampowered.com/app/{}/".format(appid)
+    lines = [
+        "⚠【致命的な報告の可能性】{}".format(app_name),
+        "キーワード「{}」を含むレビューが投稿されました（{}）"
+        "※キーワード一致による自動検知です".format(keyword, verdict),
+        text,
+        link,
+    ]
+    return "\n".join(lines)
+
+
+def _fatal_alerts_cfg(config):
+    """致命語アラートの設定を返す。無効なら None。"""
+    cfg = (config.get("analytics", {}) or {}).get("fatal_alerts", {}) or {}
+    if cfg.get("enabled", True) is False:
+        return None
+    return cfg
 
 
 class MultiNotifier:
@@ -310,16 +628,26 @@ def make_discord_notifier(webhook_url):
     return notify
 
 
+def to_slack_format(message):
+    """Slack の mrkdwn では太字は *1つ* で書く。Discord 形式の ** を * に直す。"""
+    return message.replace("**", "*")
+
+
+def to_plain_format(message):
+    """汎用 Webhook 向けに、Markdown の太字記号を外したプレーンな文にする。"""
+    return message.replace("**", "")
+
+
 def make_slack_notifier(webhook_url):
     def notify(message):
-        http_post_json(webhook_url, {"text": message[:2900]})
+        http_post_json(webhook_url, {"text": to_slack_format(message)[:2900]})
 
     return notify
 
 
 def make_generic_notifier(webhook_url):
     def notify(message):
-        http_post_json(webhook_url, {"text": message})
+        http_post_json(webhook_url, {"text": to_plain_format(message)})
 
     return notify
 
@@ -397,6 +725,143 @@ def _maybe_backfill(config, store, appid):
             )
     except Exception as e:
         print("[警告] appid={} の過去分取り込みに失敗しました: {}".format(appid, e), file=sys.stderr)
+
+
+def _maybe_snapshots(config, store, appid, base_url=None):
+    """チェック時点のスナップショットを取得して保存する。query_summary を返す。
+
+    取るもの：公式の総レビュー数・おすすめ数・低評価数・評価ラベル（query_summary）、
+    同時プレイヤー数、価格の割引率。時系列データは後からさかのぼって取れないため、
+    集計に使うかどうかに関わらず保存する。割引率の変化はセールイベントとして
+    自動登録する。どれも失敗しても本体は止めない。
+    """
+    if store is None:
+        return None
+    analytics_cfg = config.get("analytics", {}) or {}
+    qs = fetch_query_summary(appid, base_url=base_url)
+
+    players = None
+    players_cfg = analytics_cfg.get("players", {}) or {}
+    if players_cfg.get("enabled", True):
+        players = fetch_current_players(
+            appid, base_url=config.get("_players_base_url")
+        )
+        if players is not None:
+            try:
+                store.record_player_count(appid, players)
+            except Exception as e:
+                print(
+                    "[警告] appid={} の同時プレイヤー数保存に失敗しました: {}".format(appid, e),
+                    file=sys.stderr,
+                )
+
+    discount = None
+    sale_cfg = analytics_cfg.get("sale_events", {}) or {}
+    if sale_cfg.get("enabled", True):
+        discount = fetch_discount_percent(
+            appid, base_url=config.get("_appdetails_base_url")
+        )
+        if discount is not None and detect_sale_event is not None:
+            try:
+                ev = detect_sale_event(store, appid, discount)
+                if ev:
+                    print(
+                        "[イベント] appid={}: 「{}」を登録しました".format(appid, ev["title"])
+                    )
+            except Exception as e:
+                print(
+                    "[警告] appid={} のセール検知に失敗しました: {}".format(appid, e),
+                    file=sys.stderr,
+                )
+
+    if qs is not None or players is not None or discount is not None:
+        try:
+            store.record_snapshot(
+                appid,
+                total_reviews=(
+                    int(qs.get("total_reviews"))
+                    if qs and qs.get("total_reviews") is not None else None
+                ),
+                total_positive=(
+                    int(qs.get("total_positive"))
+                    if qs and qs.get("total_positive") is not None else None
+                ),
+                total_negative=(
+                    int(qs.get("total_negative"))
+                    if qs and qs.get("total_negative") is not None else None
+                ),
+                review_score_desc=qs.get("review_score_desc") if qs else None,
+                player_count=players,
+                discount_percent=discount,
+            )
+        except Exception as e:
+            print(
+                "[警告] appid={} のスナップショット保存に失敗しました: {}".format(appid, e),
+                file=sys.stderr,
+            )
+    return qs
+
+
+METADATA_SYNC_INTERVAL_SEC = 24 * 3600  # アプリ基本情報の確認は1日1回まで
+
+
+def _maybe_sync_app_metadata(config, store, appid):
+    """アプリ基本情報を取得し、変更があったときだけ履歴に残す（1日1回まで確認）。"""
+    if store is None:
+        return
+    meta_cfg = (config.get("analytics", {}) or {}).get("metadata", {}) or {}
+    if meta_cfg.get("enabled", True) is False:
+        return
+    try:
+        key = "metadata_sync:{}".format(appid)
+        last = store.get_meta(key)
+        now = int(time.time())
+        if last is not None and now - int(last) < METADATA_SYNC_INTERVAL_SEC:
+            return
+        info = fetch_app_metadata(
+            appid, base_url=config.get("_appdetails_base_url")
+        )
+        if info is None:
+            return
+        store.set_meta(key, now)
+        if store.record_app_metadata_if_changed(appid, info):
+            print("[メタデータ] appid={}: アプリ基本情報の変更を記録しました".format(appid))
+    except Exception as e:
+        print(
+            "[警告] appid={} のアプリ基本情報の取得に失敗しました: {}".format(appid, e),
+            file=sys.stderr,
+        )
+
+
+def _maybe_achievements(config, store, appid):
+    """実績の全体達成率をスナップショット保存する（既定では週1回まで）。"""
+    if store is None:
+        return
+    ach_cfg = (config.get("analytics", {}) or {}).get("achievements", {}) or {}
+    if ach_cfg.get("enabled", True) is False:
+        return
+    try:
+        interval_days = int(ach_cfg.get("interval_days", 7))
+    except (TypeError, ValueError):
+        interval_days = 7
+    try:
+        key = "achievements_sync:{}".format(appid)
+        last = store.get_meta(key)
+        now = int(time.time())
+        if last is not None and now - int(last) < interval_days * 86400:
+            return
+        achievements = fetch_global_achievements(
+            appid, base_url=config.get("_achievements_base_url")
+        )
+        if achievements is None:
+            return
+        store.record_achievement_snapshot(appid, achievements)
+        store.set_meta(key, now)
+    except Exception as e:
+        print(
+            "[警告] appid={} の実績達成率の取得に失敗しました: {}".format(appid, e),
+            file=sys.stderr,
+        )
 
 
 EVENTS_SYNC_INTERVAL_SEC = 24 * 3600  # 公式発表の同期は1日1回まで
@@ -541,6 +1006,7 @@ def check_once(config, state_path, notify, store=None):
                 "一部のレビューを取りこぼした可能性があります".format(appid),
                 file=sys.stderr,
             )
+        query_summary = None
         if store is not None:
             # 履歴の蓄積（分析層）。名前が未登録なら1回だけ取得して保存する
             try:
@@ -554,6 +1020,17 @@ def check_once(config, state_path, notify, store=None):
                 print("[警告] appid={} の履歴保存に失敗しました: {}".format(appid, e), file=sys.stderr)
             _maybe_backfill(config, store, appid)
             _maybe_sync_events(config, store, appid)
+            _maybe_sync_app_metadata(config, store, appid)
+            _maybe_achievements(config, store, appid)
+            query_summary = _maybe_snapshots(config, store, appid, base_url=base_url)
+        # 評価ラベルの陥落アラート（目安）。スナップショットで取れた query_summary を使い回す
+        try:
+            _maybe_label_alert(
+                config, state, appid, None, notify,
+                base_url=base_url, query_summary=query_summary,
+            )
+        except Exception as e:
+            print("[警告] appid={} のラベルアラート判定に失敗しました: {}".format(appid, e), file=sys.stderr)
         current_ids = [r.get("recommendationid") for r in reviews]
         if is_baseline:
             # 初回: 既存レビューは通知せず、既読として記録するだけ
@@ -570,11 +1047,31 @@ def check_once(config, state_path, notify, store=None):
                 continue
             if app_name is None:
                 app_name = fetch_app_name(appid, base_url=config.get("_appdetails_base_url"))
-            msg = format_review_message(app_name, appid, review)
+            msg = format_review_message(
+                app_name, appid, review,
+                translate_link=bool(config.get("translate_link", True)),
+            )
             results = deliver(notify, msg)
             failed_dests = [name for name, ok in results.items() if not ok]
             if any(results.values()):
                 total_notified += 1
+            # 致命語を含むレビューは、通常の通知とは別に目立つ形で知らせる
+            fatal_cfg = _fatal_alerts_cfg(config)
+            if fatal_cfg is not None and match_fatal_keyword is not None:
+                keyword = match_fatal_keyword(
+                    review.get("review") or "", fatal_cfg, appid
+                )
+                if keyword:
+                    alert_msg = format_fatal_message(app_name, appid, review, keyword)
+                    alert_results = deliver(notify, alert_msg)
+                    alert_failed = [
+                        name for name, ok in alert_results.items() if not ok
+                    ]
+                    if alert_failed:
+                        pending.setdefault(appid, {})[rid + "#fatal"] = {
+                            "message": alert_msg,
+                            "remaining": alert_failed,
+                        }
             if failed_dests:
                 # 失敗した送信先へは次回再送する。既読にはしない
                 pending.setdefault(appid, {})[rid] = {
@@ -656,6 +1153,18 @@ def validate_config(config):
     state_file = config.get("state_file", "state.json")
     if not isinstance(state_file, str) or not state_file:
         errors.append("state_file: ファイル名を文字列で指定してください")
+
+    label_alert = config.get("label_alert", {})
+    if label_alert is not None:
+        if not isinstance(label_alert, dict):
+            errors.append("label_alert: オブジェクトで指定してください")
+        else:
+            warn_within = label_alert.get("warn_within", 5)
+            if (isinstance(warn_within, bool) or not isinstance(warn_within, int)
+                    or not (1 <= warn_within <= 50)):
+                errors.append(
+                    "label_alert.warn_within: 1〜50 の整数で指定してください（現在値: {!r}）".format(warn_within)
+                )
 
     if errors:
         raise ValueError("\n".join(errors))
