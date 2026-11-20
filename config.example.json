@@ -1,9 +1,29 @@
 {
-  "app_ids": [1234560],
+  "app_ids": [
+    1234560
+  ],
   "discord_webhook_url": "https://discord.com/api/webhooks/ここにDiscordのWebhook URL（使う場合）",
   "slack_webhook_url": "",
   "webhook_url": "",
   "fetch_count": 20,
   "interval_minutes": 30,
-  "state_file": "state.json"
+  "state_file": "state.json",
+  "analytics": {
+    "enabled": true,
+    "db_file": "reviews.db",
+    "backfill": {
+      "days": 90,
+      "max_reviews": 2000,
+      "page_sleep_sec": 1.0
+    },
+    "surge": {
+      "recent_hours": 24,
+      "baseline_days": 28,
+      "min_recent_reviews": 5,
+      "min_recent_negatives": 3,
+      "ratio_delta": 0.2,
+      "ratio_floor": 0.3,
+      "cooldown_hours": 24
+    }
+  }
 }
