@@ -35,6 +35,34 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _ensure_utf8_stdio():
+    """標準出力・標準エラーを UTF-8 に統一する（Windows の文字化け対策）。
+
+    Windows では、コンソールのコードページ（既定は cp932）、ターミナルの
+    設定、ファイルやパイプへのリダイレクトで、出力経路ごとに想定する
+    文字コードが食い違い、日本語の表示が経路によって化けたり化けなかったり
+    する。プロセスの出力は UTF-8 に統一し、Windows ではコンソールの
+    コードページも UTF-8 (65001) に合わせて、全経路で同じ表示にする。
+    失敗しても動作自体は止めない（表示だけの問題として握りつぶす）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+
+
+_ensure_utf8_stdio()
+
 STEAM_REVIEWS_URL = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/"
 STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
 STEAM_NEWS_URL = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/"

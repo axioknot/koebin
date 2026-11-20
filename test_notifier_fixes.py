@@ -560,3 +560,35 @@ class TestBuildTranslatorWithFakeArgos(unittest.TestCase):
         self.assertIsNone(tr("原文", "japanese"))
         self.assertIsNone(tr("text", "klingon"))
         self.assertEqual(self.calls, [])
+
+
+class StdioEncodingTest(unittest.TestCase):
+    """Windows 既定（cp932）など標準出力が UTF-8 でない環境でも、
+    スクリプトの日本語出力が UTF-8 で出ること（文字化け対策の回帰テスト）。"""
+
+    def _run_script(self, args):
+        import os
+        import subprocess
+
+        env = dict(os.environ, PYTHONIOENCODING="cp932")
+        return subprocess.run(
+            [sys.executable, "steam_review_notifier.py"] + args,
+            cwd=str(Path(__file__).parent),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+
+    def test_stderr_is_utf8_under_cp932_stdio(self):
+        proc = self._run_script(["--config", "no_such_config.json"])
+        self.assertEqual(proc.returncode, 1)
+        # cp932 のバイト列のままなら UTF-8 として読めず例外になる
+        err = proc.stderr.decode("utf-8")
+        self.assertIn("設定ファイルが見つかりません", err)
+
+    def test_stdout_is_utf8_under_cp932_stdio(self):
+        proc = self._run_script(["--help"])
+        self.assertEqual(proc.returncode, 0)
+        out = proc.stdout.decode("utf-8")
+        self.assertIn("Steam新着レビュー通知ツール", out)

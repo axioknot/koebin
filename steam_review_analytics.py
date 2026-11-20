@@ -35,6 +35,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -42,6 +43,31 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _ensure_utf8_stdio():
+    """標準出力・標準エラーを UTF-8 に統一する（Windows の文字化け対策）。
+
+    steam_review_notifier.py と同じ対策。単体実行（digest 等）でも、
+    出力経路（コンソール／ターミナル／リダイレクト）によらず日本語が
+    同じように表示されるようにする。失敗しても動作は止めない。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+
+
+_ensure_utf8_stdio()
 
 DAY = 86400
 
