@@ -29,6 +29,7 @@
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import re
@@ -268,6 +269,15 @@ def review_permalink(review):
     return None
 
 
+def raw_json_without_author_steamid(review):
+    """生JSON保存用に、author.steamid を除いたコピーを JSON 文字列で返す。"""
+    sanitized = copy.deepcopy(review)
+    author = sanitized.get("author")
+    if isinstance(author, dict):
+        author.pop("steamid", None)
+    return json.dumps(sanitized, ensure_ascii=False)
+
+
 class ReviewStore:
     """レビュー履歴の SQLite ストア。"""
 
@@ -382,9 +392,9 @@ class ReviewStore:
     def upsert_reviews(self, appid, reviews, now=None):
         """レビューを保存する。新規に保存できた件数を返す（重複は内容の更新のみ）。
 
-        GetAppReviews のレビューオブジェクトが返す項目は落とさず保存し、
-        生の JSON も raw_json 列にそのまま残す（将来の仕様追加に備える）。
-        フィールドが応答に無い場合は NULL / 0 で保存する。
+        GetAppReviews のレビューオブジェクトが返す項目は構造化フィールドに保存し、
+        生JSONは author.steamid を除いたコピーを raw_json 列に残す
+        （将来の仕様追加に備える）。フィールドが応答に無い場合は NULL / 0 で保存する。
         """
         now = int(now if now is not None else time.time())
         inserted = 0
@@ -461,7 +471,7 @@ class ReviewStore:
                     int(r.get("timestamp_dev_responded", 0) or 0),
                     author.get("num_games_owned"),
                     author.get("num_reviews"),
-                    json.dumps(r, ensure_ascii=False),
+                    raw_json_without_author_steamid(r),
                 ),
             )
         self.conn.commit()
