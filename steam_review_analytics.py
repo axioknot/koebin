@@ -1492,7 +1492,7 @@ def main():
     if not config_path.exists():
         print("設定ファイルが見つかりません: {}".format(config_path), file=sys.stderr)
         return 1
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
 
     # 通知の組み立ては通知ツール側の実装を再利用する
     from steam_review_notifier import (

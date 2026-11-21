@@ -1502,7 +1502,7 @@ def main():
         )
         return 1
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
     except Exception as e:
         print("設定ファイルを読み込めませんでした: {}（{}）".format(config_path, e), file=sys.stderr)
         return 1

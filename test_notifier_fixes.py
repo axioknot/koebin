@@ -714,3 +714,61 @@ class StdioEncodingTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         out = proc.stdout.decode("utf-8")
         self.assertIn("Steam新着レビュー通知ツール", out)
+
+
+class BomConfigTest(unittest.TestCase):
+    """BOM 付きで保存された config.json（メモ帳や PowerShell の保存で起こる）でも
+    読み込めること（utf-8-sig 対応の回帰テスト）。"""
+
+    def _write_bom_config(self, directory):
+        config = {
+            "app_ids": [70],
+            "discord_webhook_url": "",
+            "slack_webhook_url": "",
+            "webhook_url": "http://127.0.0.1:9/dummy",
+            "fetch_count": 5,
+            "translate_link": False,
+            "analytics": {"enabled": True, "db_file": "reviews.db"},
+        }
+        path = Path(directory) / "config.json"
+        path.write_bytes(
+            b"\xef\xbb\xbf" + json.dumps(config, ensure_ascii=False).encode("utf-8")
+        )
+        return path
+
+    def _run(self, script, args):
+        import subprocess
+
+        return subprocess.run(
+            [sys.executable, script] + args,
+            cwd=str(Path(__file__).parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+
+    def test_notifier_reads_bom_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._write_bom_config(tmp)
+            proc = self._run(
+                "steam_review_notifier.py",
+                ["--config", str(config_path), "--test"],
+            )
+        err = proc.stderr.decode("utf-8")
+        out = proc.stdout.decode("utf-8")
+        self.assertNotIn("設定ファイルを読み込めませんでした", err)
+        # 読み込みを通り、ダミー宛先への送信失敗まで進むこと
+        self.assertIn("送信失敗", out)
+
+    def test_analytics_reads_bom_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = self._write_bom_config(tmp)
+            proc = self._run(
+                "steam_review_analytics.py",
+                ["--config", str(config_path), "export-csv"],
+            )
+            csv_path = Path(tmp) / "koebin-reviews.csv"
+            self.assertEqual(proc.returncode, 0)
+            self.assertTrue(csv_path.exists())
+        out = proc.stdout.decode("utf-8")
+        self.assertIn("CSVを書き出しました", out)

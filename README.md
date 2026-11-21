@@ -46,6 +46,19 @@ python steam_review_notifier.py --config config.json --test   # テスト通知�
 
 最初は `--test` で、設定した送信先にテスト通知が届くかを確認してください。
 
+### コマンドを使わずに実行する（Windows）
+
+コマンドを打たずに、ファイルをダブルクリックして実行することもできます。
+`config.json` の用意（手順3）までは済ませてから使ってください。
+
+| やりたいこと | ダブルクリックするファイル |
+|---|---|
+| 新着レビューのチェック | `check.bat` |
+| テスト通知を送る | `test-notification.bat` |
+| レビュー履歴をCSVに書き出す | `export-csv.bat` |
+
+実行すると小さなウィンドウが開いて結果が表示されます。確認したらキーを押して閉じてください。
+
 定期実行には、お使いのOSの仕組み（Windowsのタスクスケジューラ、Mac/Linuxのcronなど）で
 `--loop` なしの実行を30分おきに登録する方法も使えます。
 タスクスケジューラなどでは実行時のフォルダが一定しないため、`--config` には相対パスではなく
@@ -132,6 +145,8 @@ python steam_review_analytics.py --config config.json digest
 ```
 python steam_review_analytics.py --config config.json export-csv
 ```
+
+Windows では `export-csv.bat` をダブルクリックしても書き出せます。
 
 `config.json` と同じ場所に `koebin-reviews.csv` ができます。
 書き出し先を変える場合は `--output reviews.csv`、対象タイトルを絞る場合は `--appid 1234560` を付けます。
