@@ -29,10 +29,13 @@
     python steam_review_analytics.py --config config.json events        （登録済みイベントの一覧）
     python steam_review_analytics.py --config config.json add-event --appid 123 --date 2026-11-15 --title "大型アップデート"
     python steam_review_analytics.py --config config.json remove-event --appid 123 --event-id feed-456
+    python steam_review_analytics.py --config config.json export-csv    （蓄積したレビュー履歴をCSVに書き出す）
+    python steam_review_analytics.py --config config.json export-csv --output reviews.csv --appid 123
 """
 
 import argparse
 import copy
+import csv
 import hashlib
 import json
 import os
@@ -674,6 +677,25 @@ class ReviewStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def all_reviews(self, appid):
+        """そのタイトルの全レビューを、投稿日時の古い順に返す（CSV書き出し用）。"""
+        rows = self.conn.execute(
+            """
+            SELECT * FROM reviews
+            WHERE appid = ?
+            ORDER BY timestamp_created ASC, recommendationid ASC
+            """,
+            (str(appid),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def review_appids(self):
+        """レビューが1件以上ある App ID の一覧を返す。"""
+        rows = self.conn.execute(
+            "SELECT DISTINCT appid FROM reviews ORDER BY appid"
+        ).fetchall()
+        return [r["appid"] for r in rows]
+
     def get_meta(self, key):
         row = self.conn.execute(
             "SELECT value FROM meta WHERE key = ?", (key,)
@@ -1039,6 +1061,78 @@ def open_store(config, config_dir):
     return ReviewStore(Path(config_dir) / db_file)
 
 
+# CSV書き出しの列（見出しは Excel でそのまま読める日本語にする）。
+# 生JSON（raw_json）と投稿者の SteamID そのものは含めない（分析には不要で、
+# レビューへのリンクはレビューURL列で足りる）。
+CSV_COLUMNS = [
+    "App ID", "タイトル", "レビューID", "投稿日時", "取得日時", "更新日時",
+    "評価", "言語", "役に立った数", "おもしろい数", "重要度スコア",
+    "コメント数", "プレイ時間（レビュー時点・分）", "プレイ時間（累計・分）",
+    "プレイ時間（直近2週間・分）", "Steam購入", "無料受領",
+    "早期アクセス中の投稿", "返金済み", "開発者返信日時",
+    "投稿者の所有ゲーム数", "投稿者のレビュー数", "レビュー本文", "レビューURL",
+]
+
+
+def _fmt_ts_full(ts):
+    """UNIX時刻を「YYYY-MM-DD HH:MM:SS」（ローカル時刻）にする。0/None は空欄。"""
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(
+        int(ts), tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _csv_cell(value):
+    return "" if value is None else value
+
+
+def export_reviews_csv(store, output_path, app_ids=None):
+    """蓄積したレビュー履歴を CSV に書き出し、書き出した件数を返す。
+
+    文字コードは UTF-8（BOM付き）で、Excel でそのまま開いても文字化けしない。
+    app_ids が None の場合は、レビューが保存されている全タイトルが対象。
+    並びはタイトルごと・投稿日時の古い順。
+    """
+    if app_ids is None:
+        app_ids = store.review_appids()
+    count = 0
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_COLUMNS)
+        for appid in app_ids:
+            appid = str(appid)
+            app_name = store.get_app_name(appid) or ""
+            for r in store.all_reviews(appid):
+                writer.writerow([
+                    appid,
+                    app_name,
+                    r.get("recommendationid") or "",
+                    _fmt_ts_full(r.get("timestamp_created")),
+                    _fmt_ts_full(r.get("first_seen_at")),
+                    _fmt_ts_full(r.get("timestamp_updated")),
+                    "おすすめ" if r.get("voted_up") else "おすすめしない",
+                    language_name(r.get("language") or ""),
+                    r.get("votes_up") or 0,
+                    r.get("votes_funny") or 0,
+                    _csv_cell(r.get("weighted_vote_score")),
+                    r.get("comment_count") or 0,
+                    r.get("playtime_at_review") or 0,
+                    r.get("playtime_forever") or 0,
+                    r.get("playtime_last_two_weeks") or 0,
+                    _csv_cell(r.get("steam_purchase")),
+                    _csv_cell(r.get("received_for_free")),
+                    _csv_cell(r.get("written_during_early_access")),
+                    _csv_cell(r.get("refunded")),
+                    _fmt_ts_full(r.get("timestamp_dev_responded")),
+                    _csv_cell(r.get("author_num_games_owned")),
+                    _csv_cell(r.get("author_num_reviews")),
+                    r.get("review_text") or "",
+                    review_permalink(r) or "",
+                ])
+                count += 1
+    return count
+
+
 DEFAULT_SALE_EVENTS = {
     "enabled": True,  # 割引の開始・終了をイベントとして自動登録するか
 }
@@ -1381,12 +1475,14 @@ def main():
     parser.add_argument(
         "command",
         choices=["digest", "check-surge", "backfill", "import-history",
-                 "sync-events", "events", "add-event", "remove-event"],
+                 "sync-events", "events", "add-event", "remove-event",
+                 "export-csv"],
         help="実行する処理",
     )
     parser.add_argument("--dry-run", action="store_true", help="送信せず標準出力に表示する")
     parser.add_argument("--force", action="store_true", help="backfill / import-history を実施済みでも再実行する")
-    parser.add_argument("--appid", help="add-event / remove-event の対象タイトル")
+    parser.add_argument("--appid", help="add-event / remove-event / export-csv の対象タイトル")
+    parser.add_argument("--output", help="export-csv の書き出し先（省略時は config と同じ場所の koebin-reviews.csv）")
     parser.add_argument("--date", help="add-event の日付（YYYY-MM-DD）")
     parser.add_argument("--title", help="add-event のイベント名")
     parser.add_argument("--event-id", help="remove-event で消すイベントのID")
@@ -1458,6 +1554,21 @@ def main():
                     return 1
                 ok = store.delete_event(str(args.appid), args.event_id)
                 print("削除しました" if ok else "該当するイベントがありませんでした")
+        finally:
+            store.close()
+        return 0
+
+    if args.command == "export-csv":
+        store = open_store(config, config_path.parent)
+        try:
+            if args.appid:
+                app_ids = [str(args.appid)]
+            else:
+                app_ids = [str(a) for a in config.get("app_ids", [])] or None
+            output = Path(args.output) if args.output else (
+                config_path.parent / "koebin-reviews.csv")
+            count = export_reviews_csv(store, output, app_ids=app_ids)
+            print("CSVを書き出しました: {}（{}件）".format(output, count))
         finally:
             store.close()
         return 0

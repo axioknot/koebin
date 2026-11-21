@@ -518,19 +518,26 @@ class TestBuildTranslatorWithFakeArgos(unittest.TestCase):
         calls = self.calls
 
         class FakeTranslation:
-            def __init__(self, tag):
-                self.tag = tag
+            """実物らしい訳文を返すフェイク。
+
+            旧フェイクは「EN:원문」のような文字列を返していたが、原文の
+            ハングルを含む「英語」は崩壊検出（_translation_looks_broken）に
+            正しく引っかかるため、経路のテストでは実物らしい文を返す。
+            """
+
+            def __init__(self, text):
+                self.text = text
 
             def translate(self, text):
-                return self.tag + text
+                return self.text
 
         def fake_from_codes(frm, to):
             calls.append((frm, to))
             if (frm, to) == ("en", "ja"):
-                return FakeTranslation("訳文：")
+                return FakeTranslation("これは翻訳されたレビューの文です。")
             if (frm, to) == ("ko", "ja"):
                 return None  # 日本語への直接パッケージは無い（実索引どおり）
-            return FakeTranslation("EN:")
+            return FakeTranslation("This is a translated review sentence.")
 
         pkg = types.ModuleType("argostranslate")
         tr = types.ModuleType("argostranslate.translate")
@@ -551,7 +558,7 @@ class TestBuildTranslatorWithFakeArgos(unittest.TestCase):
         tr = notifier.build_translator({"translate_display": True})
         self.assertIsNotNone(tr)
         # 直接パッケージが無いので英語経由（ko→en→ja）になる
-        self.assertEqual(tr("원문", "koreana"), "訳文：EN:원문")
+        self.assertEqual(tr("원문", "koreana"), "これは翻訳されたレビューの文です。")
         self.assertEqual(
             self.calls, [("ko", "ja"), ("ko", "en"), ("en", "ja")])
 
@@ -560,6 +567,121 @@ class TestBuildTranslatorWithFakeArgos(unittest.TestCase):
         self.assertIsNone(tr("原文", "japanese"))
         self.assertIsNone(tr("text", "klingon"))
         self.assertEqual(self.calls, [])
+
+
+class TestTranslationLooksBroken(unittest.TestCase):
+    """崩壊検出の単体テスト。サンプルは Argos 実環境での実測出力（2026-11-21）。
+
+    崩壊例は棄却（True）、意味が通る訳文（下手な訳・直訳調を含む）は
+    通過（False）になることを確認する。流暢だが意味が違う誤訳は
+    検出対象外なので、通過側に含めてある。
+    """
+
+    BROKEN = [
+        # (原文, 出力, 出力言語) — SNS担当の検証で確認された実例（ko→en→ja）
+        ("다들 재밌다고는 하는데 난 별로..\n발라트로는 재밌었는데 이건 안맞네",
+         "... .\n는 는", "en"),
+        ("다들 재밌다고는 하는데 난 별로..\n발라트로는 재밌었는데 이건 안맞네",
+         "・・・\n社会招聘", "ja"),
+        # テンプレート文字列の混入（ko 口語の不満文で実測）
+        ("아니 이게 왜 이렇게 렉이 심해요? 최적화 개판이네 진짜 돈 아까움",
+         "Why does this work? {{if compare at price min > price min}}", "en"),
+        ("아니 이게 왜 이렇게 렉이 심해요? 최적화 개판이네 진짜 돈 아까움",
+         "なぜこの仕事? {{if は価格 min で比較します。", "ja"),
+        # 節の大半が欠落（zh 口語の不満文で実測）
+        ("什么破优化啊，卡得要死，动不动就闪退，钱白花了", "地獄とは?", "ja"),
+        # 記号だけの出力（SNS担当が ctranslate2 直接実行で確認）
+        ("다들 재밌다고는 하는데 난 별로..", "⁇ ⁇ ⁇ ⁇", "en"),
+    ]
+
+    NOT_BROKEN = [
+        ("이 게임은 정말 재미있습니다.", "This game is really fun.", "en"),
+        ("이 게임은 정말 재미있습니다.", "このゲームは本当に楽しいです。", "ja"),
+        ("이 게임은 그래픽이 아름답고 음악도 훌륭합니다. 스토리가 조금 짧지만 전체적으로 만족스러운 경험이었습니다.",
+         "このゲームは美しいですし、音楽も素晴らしいです。 ストーリーは少し短く、満足感あふれる体験でした。", "ja"),
+        # 下手だが断片化ではない（ko 口語短文）
+        ("이 게임 개재밌음 진짜 시간 가는 줄 모름", "リアルタイムのこのゲームの面白い瞬間", "ja"),
+        # 意味は歪むが文は成立する（流暢な誤訳は対象外）
+        ("솔직히 기대 안 했는데 생각보다 훨씬 재밌네요. 친구랑 같이 하면 더 웃기고 시간 순삭임. 단점은 좀 비싸다는 거? 그래도 세일하면 무조건 사세요",
+         "思ったよりもとても楽しいことを期待しなかった。 友達が好きなら笑う時間です。 それは少し高価ですか? ご購入の際は、ご使用ください。", "ja"),
+        # スラングが英語のまま残るのは正常範囲（en→ja）
+        ("ngl this game is bussin fr, played 200 hours and still not bored lol. devs cooked with this one",
+         "ngl このゲームはバスシンfrで、200時間再生され、まだ退屈な笑いではありません。 この1で調理されたdevs", "ja"),
+        ("10/10 would die again. masterpiece.", "10/10は再び死にます。 マスターピース。", "ja"),
+        ("i didn't experience what other people i know experienced playing this but that's alright",
+         "経験を積んだ人達がこのことを経験したことはなかったが、それは大丈夫だ", "ja"),
+        ("神作，不解释，yyds", "神、説明なし、yyds。", "ja"),
+        ("игра просто огонь, залип на всю ночь, с друзьями вообще угар",
+         "ゲームは、一般的な火災の友人と、すべての夜に立ち往生し、火災です", "ja"),
+        ("честно говоря не ожидал ничего особенного, а в итоге затянуло часов на сто, только цена кусается, ждите скидок",
+         "正直、私は何か特別な期待をしなかったが、最終的には100時間かかり、価格のビットだけ、割引を待ちます。", "ja"),
+    ]
+
+    def test_broken_outputs_detected(self):
+        for src, out, target in self.BROKEN:
+            with self.subTest(out=out):
+                self.assertTrue(
+                    notifier._translation_looks_broken(src, out, target))
+
+    def test_fluent_outputs_pass(self):
+        for src, out, target in self.NOT_BROKEN:
+            with self.subTest(out=out):
+                self.assertFalse(
+                    notifier._translation_looks_broken(src, out, target))
+
+    def test_empty_output_is_broken(self):
+        self.assertTrue(notifier._translation_looks_broken("原文です", "", "ja"))
+        self.assertTrue(notifier._translation_looks_broken("原文です", None, "ja"))
+
+
+class TestBuildTranslatorCollapseFallback(unittest.TestCase):
+    """崩壊した訳文は出さず、None（＝翻訳リンク表示へのフォールバック）になること。"""
+
+    def setUp(self):
+        import types
+
+        class FakeTranslation:
+            def __init__(self, text):
+                self.text = text
+
+            def translate(self, text):
+                return self.text
+
+        def fake_from_codes(frm, to):
+            if (frm, to) == ("ko", "en"):
+                # 確認済みの崩壊例そのもの（中間段で棄却されるはず）
+                return FakeTranslation("... .\n는 는")
+            if (frm, to) == ("en", "ja"):
+                return FakeTranslation("・・・\n社会招聘")
+            return None
+
+        pkg = types.ModuleType("argostranslate")
+        tr = types.ModuleType("argostranslate.translate")
+        tr.get_translation_from_codes = fake_from_codes
+        pkg.translate = tr
+        self._saved = {k: sys.modules.get(k) for k in ("argostranslate", "argostranslate.translate")}
+        sys.modules["argostranslate"] = pkg
+        sys.modules["argostranslate.translate"] = tr
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    def test_collapsed_pivot_returns_none(self):
+        tr = notifier.build_translator({"translate_display": True})
+        self.assertIsNotNone(tr)
+        src = "다들 재밌다고는 하는데 난 별로..\n발라트로는 재밌었는데 이건 안맞네"
+        self.assertIsNone(tr(src, "koreana"))
+
+    def test_collapsed_direct_returns_none(self):
+        tr = notifier.build_translator({"translate_display": True})
+        src = ("This game has beautiful graphics and a wonderful soundtrack. "
+               "The story is a bit short, but overall it was satisfying.")
+        # en→ja のフェイクも崩壊例を返すので、直接経路でも None になる
+        self.assertIsNone(tr(src, "english"))
 
 
 class StdioEncodingTest(unittest.TestCase):

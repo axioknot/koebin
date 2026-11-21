@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -129,12 +130,85 @@ STEAM_TO_ISO = {
 }
 
 
+def _translation_looks_broken(source, output, target):
+    """機械翻訳の出力が「崩壊」しているかを判定する（標準ライブラリのみ）。
+
+    口語・断片的なレビュー文では、Argos のモデルが (1) 記号と原文の断片だけの
+    出力を返す、(2) テンプレート文字列（{{...}}）を混ぜる、(3) 文の節の大半を
+    落とす、といった崩壊を起こすことが実測で確認されている（韓国語→英語で
+    再現。中国語→英語でも節の欠落を確認。設計の経緯は
+    translation-collapse-fallback-design-2026-11-21.md）。
+    崩壊した訳文を「翻訳」として表示しないため、検出したら翻訳自体を
+    失敗扱いにし、呼び出し側の既存動作（翻訳リンク表示）へ戻す。
+
+    誤検出のコストは「リンク表示になるだけ」で小さいため、判定は厳しめに
+    倒す。文としては成立するが意味が違う誤訳（流暢な誤訳）は、この判定では
+    捕まえられない（対象外。原文併記で利用者が確認する前提）。
+
+    source: 原文, output: 翻訳出力, target: 出力の言語コード（"en" / "ja" 等）
+    """
+    if not output or not output.strip():
+        return True
+    out = output.strip()
+    src_ns = len(re.sub(r"\s", "", source or ""))
+    out_ns = len(re.sub(r"\s", "", out))
+    if not src_ns or not out_ns:
+        return True
+
+    # --- 強い信号（1つで崩壊とみなす） ---
+    letters = [c for c in out if c.isalpha()]
+    if target == "en" and len(letters) >= 2:
+        # 英語のはずの出力に、原文の文字（ハングル・漢字・キリル等）が残る
+        nonlatin = sum(
+            1 for c in letters if "LATIN" not in unicodedata.name(c, ""))
+        if nonlatin >= 2 and nonlatin / len(letters) >= 0.2:
+            return True
+    if target == "ja" and letters:
+        # 日本語のはずの出力に、原文の文字体系が残る（ラテン文字は対象外：
+        # ゲーム用語やスラングが英語のまま残るのは正常な範囲）
+        residue = sum(
+            1 for c in letters
+            if unicodedata.name(c, "").startswith(
+                ("HANGUL", "CYRILLIC", "THAI", "ARABIC", "HEBREW")))
+        if residue >= 2 and residue / len(letters) >= 0.1:
+            return True
+    if "{{" in out or "}}" in out or "<unk>" in out:
+        return True  # テンプレート／プレースホルダの混入
+    if out_ns >= 4:
+        alnum = sum(1 for c in out if c.isalnum())
+        if alnum / out_ns < 0.4:
+            return True  # 英数字がほとんど無い断片（記号だけ等）
+    if src_ns >= 20 and out_ns / src_ns < 0.30:
+        return True  # 長さの極端な縮み（実測の正常例の最小は 0.45）
+
+    # --- 弱い信号（2つ以上で崩壊とみなす） ---
+    weak = 0
+    if out_ns >= 8:
+        symbols = sum(1 for c in out if not c.isalnum() and not c.isspace())
+        if symbols / out_ns > 0.35:
+            weak += 1
+    tokens = out.split()
+    if len(tokens) >= 5 and len(set(tokens)) / len(tokens) < 0.4:
+        weak += 1  # 同じトークンの繰り返し
+    if out_ns >= 10:
+        counts = {}
+        for c in re.sub(r"\s", "", out):
+            counts[c] = counts.get(c, 0) + 1
+        if counts and max(counts.values()) / out_ns >= 0.5:
+            weak += 1  # 同一文字が過半を占める
+    clauses = [p for p in re.split(r"[。.!?！？,、，\n]", source or "") if p.strip()]
+    if len(clauses) >= 3 and out_ns <= 8:
+        weak += 1  # 原文は複数節あるのに、出力が極端に短い断片
+    return weak >= 2
+
+
 def build_translator(config):
     """任意機能：ローカル機械翻訳（Argos Translate）の呼び出し口を作る。
 
     config の translate_display が true のときだけ有効になる。
     argostranslate が入っていない、言語パッケージが無い、翻訳に失敗した、
-    のいずれでも None を返し、通知は従来どおり（原文＋翻訳リンク）で届く。
+    翻訳結果が崩壊していると判定した、のいずれでも None を返し、
+    通知は従来どおり（原文＋翻訳リンク）で届く。
     翻訳は利用者のPCの中で行い、外部に本文を送らない。
     """
     if not config.get("translate_display"):
@@ -167,17 +241,26 @@ def build_translator(config):
             direct = _get(from_code, target)
             if direct is not None:
                 result = direct.translate(text)
-                return result.strip() if result else None
+                if result and result.strip() and \
+                        not _translation_looks_broken(text, result, target):
+                    return result.strip()
+                return None
             # Argos の言語パッケージは日本語への直接変換が英語からしか無い
             # （2026-11 時点の公式索引で確認）。無い場合は英語を経由する。
+            # 経由する場合は中間の英語も検査する：中間が崩れていると、
+            # 後段がその断片を訳して意味をなさない日本語になるため。
             if target != "en":
                 leg1 = _get(from_code, "en")
                 leg2 = _get("en", target)
                 if leg1 is not None and leg2 is not None:
                     mid = leg1.translate(text)
-                    if mid:
-                        result = leg2.translate(mid)
-                        return result.strip() if result else None
+                    if not mid or _translation_looks_broken(text, mid, "en"):
+                        return None
+                    result = leg2.translate(mid)
+                    if result and result.strip() and \
+                            not _translation_looks_broken(text, result, target):
+                        return result.strip()
+                    return None
             return None
         except Exception:
             return None
