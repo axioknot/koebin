@@ -37,6 +37,7 @@ import argparse
 import copy
 import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -1099,38 +1100,61 @@ def export_reviews_csv(store, output_path, app_ids=None):
     with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(CSV_COLUMNS)
-        for appid in app_ids:
-            appid = str(appid)
-            app_name = store.get_app_name(appid) or ""
-            for r in store.all_reviews(appid):
-                writer.writerow([
-                    appid,
-                    app_name,
-                    r.get("recommendationid") or "",
-                    _fmt_ts_full(r.get("timestamp_created")),
-                    _fmt_ts_full(r.get("first_seen_at")),
-                    _fmt_ts_full(r.get("timestamp_updated")),
-                    "おすすめ" if r.get("voted_up") else "おすすめしない",
-                    language_name(r.get("language") or ""),
-                    r.get("votes_up") or 0,
-                    r.get("votes_funny") or 0,
-                    _csv_cell(r.get("weighted_vote_score")),
-                    r.get("comment_count") or 0,
-                    r.get("playtime_at_review") or 0,
-                    r.get("playtime_forever") or 0,
-                    r.get("playtime_last_two_weeks") or 0,
-                    _csv_cell(r.get("steam_purchase")),
-                    _csv_cell(r.get("received_for_free")),
-                    _csv_cell(r.get("written_during_early_access")),
-                    _csv_cell(r.get("refunded")),
-                    _fmt_ts_full(r.get("timestamp_dev_responded")),
-                    _csv_cell(r.get("author_num_games_owned")),
-                    _csv_cell(r.get("author_num_reviews")),
-                    r.get("review_text") or "",
-                    review_permalink(r) or "",
-                ])
-                count += 1
+        for row in _csv_data_rows(store, app_ids):
+            writer.writerow(row)
+            count += 1
     return count
+
+
+def _csv_data_rows(store, app_ids):
+    """CSV のデータ行を順に返す（見出しは含まない）。書き出し先の違いを吸収する。"""
+    for appid in app_ids:
+        appid = str(appid)
+        app_name = store.get_app_name(appid) or ""
+        for r in store.all_reviews(appid):
+            yield [
+                appid,
+                app_name,
+                r.get("recommendationid") or "",
+                _fmt_ts_full(r.get("timestamp_created")),
+                _fmt_ts_full(r.get("first_seen_at")),
+                _fmt_ts_full(r.get("timestamp_updated")),
+                "おすすめ" if r.get("voted_up") else "おすすめしない",
+                language_name(r.get("language") or ""),
+                r.get("votes_up") or 0,
+                r.get("votes_funny") or 0,
+                _csv_cell(r.get("weighted_vote_score")),
+                r.get("comment_count") or 0,
+                r.get("playtime_at_review") or 0,
+                r.get("playtime_forever") or 0,
+                r.get("playtime_last_two_weeks") or 0,
+                _csv_cell(r.get("steam_purchase")),
+                _csv_cell(r.get("received_for_free")),
+                _csv_cell(r.get("written_during_early_access")),
+                _csv_cell(r.get("refunded")),
+                _fmt_ts_full(r.get("timestamp_dev_responded")),
+                _csv_cell(r.get("author_num_games_owned")),
+                _csv_cell(r.get("author_num_reviews")),
+                r.get("review_text") or "",
+                review_permalink(r) or "",
+            ]
+
+
+def export_reviews_csv_text(store, app_ids=None):
+    """CSV の内容を文字列で返す（操作画面からのダウンロード用）。(本文, 件数) を返す。
+
+    文字コードの BOM は呼び出し側で付ける（ここでは付けない）。
+    """
+    if app_ids is None:
+        app_ids = store.review_appids()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(CSV_COLUMNS)
+    count = 0
+    for row in _csv_data_rows(store, app_ids):
+        writer.writerow(row)
+        count += 1
+    return buf.getvalue(), count
 
 
 DEFAULT_SALE_EVENTS = {
