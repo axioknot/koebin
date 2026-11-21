@@ -822,7 +822,10 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
         form = {k: vals[0] for k, vals in urllib.parse.parse_qs(body).items()}
-        if not self._guard(form):
+        # フォームはトークンを送信先URLのクエリに載せる（App.url）。本文だけを見ると
+        # ブラウザからの正規の送信を弾いてしまうため、クエリ側も合わせて照合する。
+        query = {k: vals[0] for k, vals in urllib.parse.parse_qs(parsed.query).items()}
+        if not self._guard({**query, **form}):
             return
         app = self.app
         if parsed.path == "/action/check":
