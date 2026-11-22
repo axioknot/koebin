@@ -720,6 +720,14 @@ def _maybe_label_alert(config, state, appid, app_name, notify, base_url=None,
         markers[appid] = marker
 
 
+def excerpt80(text):
+    """通知の抜粋は全角80字まで（DESIGN.md N-3）。続きはリンクで読む。"""
+    t = (text or "").strip().replace("\n", " ")
+    if len(t) > 80:
+        t = t[:79] + "…"
+    return t
+
+
 def format_review_message(app_name, appid, review, translate_link=True,
                           translator=None):
     author = review.get("author", {}) or {}
@@ -729,9 +737,7 @@ def format_review_message(app_name, appid, review, translate_link=True,
     playtime_h = (minutes or 0) / 60.0
     verdict = "👍 おすすめ" if review.get("voted_up") else "👎 おすすめしない"
     lang = language_name(review.get("language", ""))
-    text = (review.get("review") or "").strip().replace("\n", " ")
-    if len(text) > 300:
-        text = text[:300] + "…"
+    text = excerpt80(review.get("review") or "")
     ts = review.get("timestamp_created", 0)
     when = ""
     if ts:
@@ -742,9 +748,9 @@ def format_review_message(app_name, appid, review, translate_link=True,
         link = "https://steamcommunity.com/profiles/{}/recommended/{}/".format(steamid, appid)
     else:
         link = "https://store.steampowered.com/app/{}/".format(appid)
+    # 並びは DESIGN.md N-1：評価→タイトル→要点（抜粋）→補足→リンク。1行目で判定できる形にする
     lines = [
-        "**【新着レビュー】{}**".format(app_name),
-        "{}｜言語: {}｜プレイ時間: {:.1f}時間｜{}".format(verdict, lang, playtime_h, when),
+        "**{}｜{}**".format(verdict, app_name),
         text,
     ]
     # 日本語以外のレビュー：任意機能のローカル翻訳が使えれば翻訳文を出す。
@@ -755,7 +761,8 @@ def format_review_message(app_name, appid, review, translate_link=True,
     if translator is not None and raw:
         translated = translator(raw[:300], review.get("language") or "")
     if translated:
-        lines.append("翻訳（機械翻訳）: {}".format(translated.replace("\n", " ")))
+        lines.append("翻訳（機械翻訳）: {}".format(excerpt80(translated)))
+    lines.append("言語: {}｜プレイ時間: {:.1f}時間｜{}".format(lang, playtime_h, when))
     lines.append(link)
     if not translated and translate_link and (review.get("language") or "") not in ("", "japanese"):
         if raw:
@@ -772,9 +779,7 @@ def format_fatal_message(app_name, appid, review, keyword):
     """致命語を含むレビューの即時アラート文。"""
     author = review.get("author", {}) or {}
     verdict = "👍 おすすめ" if review.get("voted_up") else "👎 おすすめしない"
-    text = (review.get("review") or "").strip().replace("\n", " ")
-    if len(text) > 200:
-        text = text[:200] + "…"
+    text = excerpt80(review.get("review") or "")
     steamid = author.get("steamid")
     if steamid:
         link = "https://steamcommunity.com/profiles/{}/recommended/{}/".format(steamid, appid)

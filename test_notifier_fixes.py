@@ -772,3 +772,44 @@ class BomConfigTest(unittest.TestCase):
             self.assertTrue(csv_path.exists())
         out = proc.stdout.decode("utf-8")
         self.assertIn("CSVを書き出しました", out)
+
+
+class DesignNotificationRulesTest(unittest.TestCase):
+    """DESIGN.md N-1（評価→タイトル→要点→補足→リンク）と N-3（抜粋80字まで）の回帰防止。"""
+
+    def test_new_review_first_line_starts_with_verdict(self):
+        review = make_review(11, language="japanese", text="面白い")
+        msg = notifier.format_review_message("Fixture Game", "123", review)
+        first = msg.splitlines()[0]
+        self.assertTrue(first.startswith("**👍 おすすめ｜Fixture Game**"), first)
+
+    def test_new_review_excerpt_capped_at_80(self):
+        review = make_review(12, language="japanese", text="あ" * 200)
+        msg = notifier.format_review_message("Fixture Game", "123", review)
+        excerpt_line = msg.splitlines()[1]
+        self.assertLessEqual(len(excerpt_line), 80)
+        self.assertTrue(excerpt_line.endswith("…"))
+
+    def test_fatal_excerpt_capped_at_80(self):
+        review = make_review(13, language="japanese", text="い" * 200)
+        msg = notifier.format_fatal_message("Fixture Game", "123", review, "起動しない")
+        lines = msg.splitlines()
+        self.assertLessEqual(len(lines[2]), 80)
+
+    def test_analytics_excerpt_capped_at_80(self):
+        from steam_review_analytics import _excerpt, format_surge_text
+        self.assertLessEqual(len(_excerpt("う" * 200)), 80)
+        result = {
+            "recent": {"down": 3, "total": 5, "neg_languages": {},
+                       "top_reviews": [{"voted_up": False, "review_text": "え" * 200,
+                                        "playtime_forever": 600, "timestamp_created": 1,
+                                        "steamid": "1", "appid": "123"}]},
+            "cfg": {"recent_hours": 24, "baseline_days": 28},
+            "recent_neg_ratio": 0.6,
+            "baseline": {"total": 10, "down": 1, "neg_languages": {}},
+            "baseline_neg_ratio": 0.1,
+        }
+        text = format_surge_text("123", "Game", result)
+        excerpt_line = [l for l in text.splitlines() if "「" in l][0]
+        inner = excerpt_line.split("「")[1].rstrip("」")
+        self.assertLessEqual(len(inner), 80)

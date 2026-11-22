@@ -9,6 +9,9 @@ Steamでゲームを販売している開発者向けの、小さな通知ツー
 
 by Axioknot
 
+![Discordに届いた新着レビュー通知の実例](notification-example.png)
+（Discord への通知の例です。新しいレビューが来ると、評価が1行目に来る形で届きます）
+
 ## 特徴
 
 - 複数タイトルをまとめて監視できます
@@ -85,9 +88,9 @@ python steam_review_notifier.py --config config.json --test   # テスト通知�
 ## 通知の例
 
 ```
-【新着レビュー】（ゲーム名）
-👍 おすすめ｜言語: 日本語｜プレイ時間: 12.5時間｜2026-11-20 10:26
-（レビュー本文の抜粋）
+👍 おすすめ｜（ゲーム名）
+（レビュー本文の抜粋。80字までで、続きはリンク先で読めます）
+言語: 日本語｜プレイ時間: 12.5時間｜2026-11-20 10:26
 https://steamcommunity.com/profiles/（投稿者のSteamID）/recommended/（App ID）/
 ```
 

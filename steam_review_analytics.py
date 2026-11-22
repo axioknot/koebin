@@ -814,10 +814,11 @@ def window_stats(reviews):
     }
 
 
-def _excerpt(text, limit=120):
+def _excerpt(text, limit=80):
+    # 通知の抜粋は全角80字まで（DESIGN.md N-3）。省略記号を含めて limit 字に収める
     t = (text or "").strip().replace("\n", " ")
     if len(t) > limit:
-        t = t[:limit] + "…"
+        t = t[:limit - 1] + "…"
     return t
 
 
@@ -1021,7 +1022,7 @@ def format_surge_text(appid, app_name, result):
         for x in negatives[:3]:
             playtime_h = int(x.get("playtime_forever", 0) or 0) / 60.0
             lines.append(
-                "・{:.0f}時間｜「{}」".format(playtime_h, _excerpt(x["review_text"], 100))
+                "・{:.0f}時間｜「{}」".format(playtime_h, _excerpt(x["review_text"], 80))
             )
             link = review_permalink(x)
             if link:
