@@ -133,12 +133,12 @@ argospm install translate-en_ja
 取得したレビューは、設定ファイルと同じフォルダの `reviews.db`（SQLite）に蓄積されます。
 蓄積した履歴から、次の2つが使えます。どちらも集計と整形はプログラムだけで行い、AIは使いません。
 
-初回実行時には、過去分もさかのぼって履歴に取り込みます（初期値：直近90日・最大2,000件。
+初回実行時には、過去分もさかのぼって履歴に取り込みます（初期値：直近90日・1タイトルあたり2,000件まで。ページ単位で取得するため、数十件ほど超えることがあります。
 `config.json` の `analytics.backfill` の `days` / `max_reviews` で変更できます）。
 取り込んだ過去分が通知されることはありません。履歴への取り込みだけです。
-手動で取り込み直す場合は `python steam_review_analytics.py --config config.json backfill` を実行してください。
+手動で取り込み直す場合は `python steam_review_analytics.py --config config.json backfill --force` を実行してください。
 あわせて、発売当初からの月ごとのレビュー件数（月次集計）も初回に取り込みます。
-こちらは手動では `python steam_review_analytics.py --config config.json import-history` で取り込み直せます。
+こちらは手動では `python steam_review_analytics.py --config config.json import-history --force` で取り込み直せます。
 `analytics.histogram.enabled` を `false` にすると、この取り込みと後述の「長期の傾向」の表示を止められます。
 データベースのファイル名は `analytics.db_file` で変更できます（初期値は `reviews.db`）。
 分析層を使わない場合は `analytics.enabled` を `false` にしてください。
@@ -350,7 +350,7 @@ Steamの公式Web APIと、ストアの公開エンドポイント（どちら�
 - こえびんが取得するのは直近のレビューです（1回の取得件数に上限があります）。チェック間隔が空きすぎると取りこぼす場合があります。キーなしで取得する場合、Steam側の回数制限が厳しく、取得結果が最大で10分ほど遅れることがあります。30分間隔程度の運用では問題になりません
 - SteamのレビューAPIは2026年10月2日に移行が告知され、10月22日に旧エンドポイント `store.steampowered.com/appreviews` が廃止されました。本ツールは新しいAPIに対応済みです。出典：[Changes to Steam User Reviews API（Steamworks Development 公式アナウンス）](https://store.steampowered.com/news/group/4145017/view/676258795703241580)
 - チームで使う場合は、レビュー本文がそのまま流れるため、非公開のチャンネルでの利用を推奨します。Issueで不具合を報告いただく際は、実際のレビュー本文、DBファイル、WebhookのURLを貼らないでください
-- 分析層の履歴は、初回の取り込み（直近90日・最大2,000件まで）と、本ツールを動かしていた期間に取得できたレビューです。それより古い分や、止めていた期間に流れた大量のレビューは蓄積されません。急増判定の材料（平常時の水準）が十分でない間は、アラートは出ません
+- 分析層の履歴は、初回の取り込み（直近90日・1タイトルあたり2,000件まで。ページ単位で取得するため、数十件ほど超えることがあります）と、本ツールを動かしていた期間に取得できたレビューです。それより古い分や、止めていた期間に流れた大量のレビューは蓄積されません。急増判定の材料（平常時の水準）が十分でない間は、アラートは出ません
 
 ## ライセンス
 

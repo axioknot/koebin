@@ -375,6 +375,8 @@ button.subtle:disabled:hover { background: transparent; border-color: #8F887C; }
 pre.log, pre.digest { background: #F4F2EC; border-radius: 3px;
   padding: 16px; font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
   font-family: "SFMono-Regular", Consolas, "Courier New", monospace; }
+pre.digest a { display: inline-block; padding: 3px 0; }
+.jobupd { display: inline-block; padding: 5px 8px; }
 .banner { border: 1px solid #072A7C; color: #072A7C; border-radius: 3px; padding: 8px 16px; font-size: 14px; margin: 0 0 16px; }
 .errors { border: 1px solid #B3402A; color: #B3402A; border-radius: 3px; padding: 8px 16px 8px 32px; font-size: 14px; margin: 0 0 16px; }
 label.f { display: block; font-size: 14px; color: #57534B; letter-spacing: .04em; margin: 16px 0 8px; }
@@ -520,7 +522,7 @@ class App:
             status = "エラーで終了しました（{}）".format(job.finished_at or "")
         update = ""
         if job.running:
-            update = ' <a href="{}">最新の状態に更新</a>'.format(esc(back_url))
+            update = ' <a class="jobupd" href="{}">最新の状態に更新</a>'.format(esc(back_url))
         return (
             '<section><h2>実行結果（{}）</h2>'
             '<p class="note"><span id="job-status" aria-live="polite">{}</span>{}</p>'
