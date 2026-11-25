@@ -5,7 +5,8 @@ title こえびん - CSV書き出し
 
 if not exist "config.json" (
     echo 設定ファイル config.json が見つかりません。
-    echo config.example.json を config.json という名前でコピーし、通知先のURLと App ID を書いてから、もう一度実行してください。
+    echo config.example.json を config.json という名前でコピーし、App ID を書いてから、もう一度実行してください。
+    echo 通知先のURLは、CSVの書き出しだけなら空のままで構いません。
     echo.
     pause
     exit /b 1

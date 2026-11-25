@@ -1431,7 +1431,7 @@ def validate_config(config):
             parsed = urllib.parse.urlparse(v)
             if parsed.scheme not in ("http", "https") or not parsed.netloc:
                 errors.append("{}: URLの形式が正しくありません（{}）".format(key, v))
-    if not any_webhook:
+    if not any_webhook and not config.get("fetch_only"):
         errors.append(
             "通知先が未設定です: discord_webhook_url / slack_webhook_url / webhook_url のいずれかを設定してください"
         )
@@ -1520,8 +1520,13 @@ def main():
 
     notify = build_notifier(config)
     if notify is None:
-        print("通知先が未設定です。config.json を確認してください。", file=sys.stderr)
-        return 1
+        if config.get("fetch_only"):
+            # 取得のみモード：通知先が無くても、取得と保存だけを行う
+            notify = MultiNotifier([])
+            print("通知先が未設定のため、取得のみ（通知なし）で実行します。")
+        else:
+            print("通知先が未設定です。config.json を確認してください。", file=sys.stderr)
+            return 1
 
     if args.test:
         message = (

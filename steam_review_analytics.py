@@ -31,6 +31,7 @@
     python steam_review_analytics.py --config config.json remove-event --appid 123 --event-id feed-456
     python steam_review_analytics.py --config config.json export-csv    （蓄積したレビュー履歴をCSVに書き出す）
     python steam_review_analytics.py --config config.json export-csv --output reviews.csv --appid 123
+    python steam_review_analytics.py --config config.json export-snapshots（記録したスナップショットの時系列をCSVに書き出す）
 """
 
 import argparse
@@ -556,6 +557,19 @@ class ReviewStore:
             (str(appid),),
         ).fetchone()
         return dict(row) if row else None
+
+    def snapshot_appids(self):
+        rows = self.conn.execute(
+            "SELECT DISTINCT appid FROM snapshots ORDER BY appid"
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def iter_snapshots(self, appid):
+        rows = self.conn.execute(
+            "SELECT * FROM snapshots WHERE appid = ? ORDER BY ts ASC",
+            (str(appid),),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_app_metadata_if_changed(self, appid, info, ts=None):
         """アプリ基本情報を、変更があったときだけ履歴に残す。残したら True。"""
@@ -1107,6 +1121,41 @@ def export_reviews_csv(store, output_path, app_ids=None):
     return count
 
 
+SNAPSHOT_CSV_COLUMNS = [
+    "App ID", "記録日時", "レビュー総数", "好評数", "不評数",
+    "評価ラベル", "同時プレイヤー数", "割引率（%）",
+]
+
+
+def export_snapshots_csv(store, output_path, app_ids=None):
+    """記録したスナップショットの時系列を CSV に書き出し、書き出した件数を返す。
+
+    文字コードは UTF-8（BOM付き）で、Excel でそのまま開いても文字化けしない。
+    app_ids が None の場合は、スナップショットが記録されている全タイトルが対象。
+    並びはタイトルごと・記録日時の古い順。記録されなかった項目は空欄にする。
+    """
+    if app_ids is None:
+        app_ids = store.snapshot_appids()
+    count = 0
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(SNAPSHOT_CSV_COLUMNS)
+        for appid in app_ids:
+            for snap in store.iter_snapshots(appid):
+                writer.writerow([
+                    snap.get("appid"),
+                    _fmt_ts_full(snap["ts"]),
+                    snap.get("total_reviews"),
+                    snap.get("total_positive"),
+                    snap.get("total_negative"),
+                    snap.get("review_score_desc"),
+                    snap.get("player_count"),
+                    snap.get("discount_percent"),
+                ])
+                count += 1
+    return count
+
+
 def _csv_data_rows(store, app_ids):
     """CSV のデータ行を順に返す（見出しは含まない）。書き出し先の違いを吸収する。"""
     for appid in app_ids:
@@ -1501,13 +1550,13 @@ def main():
         "command",
         choices=["digest", "check-surge", "backfill", "import-history",
                  "sync-events", "events", "add-event", "remove-event",
-                 "export-csv"],
+                 "export-csv", "export-snapshots"],
         help="実行する処理",
     )
     parser.add_argument("--dry-run", action="store_true", help="送信せず標準出力に表示する")
     parser.add_argument("--force", action="store_true", help="backfill / import-history を実施済みでも再実行する")
-    parser.add_argument("--appid", help="add-event / remove-event / export-csv の対象タイトル")
-    parser.add_argument("--output", help="export-csv の書き出し先（省略時は config と同じ場所の koebin-reviews.csv）")
+    parser.add_argument("--appid", help="add-event / remove-event / export-csv / export-snapshots の対象タイトル")
+    parser.add_argument("--output", help="export-csv / export-snapshots の書き出し先（省略時は config と同じ場所の koebin-reviews.csv / koebin-snapshots.csv）")
     parser.add_argument("--date", help="add-event の日付（YYYY-MM-DD）")
     parser.add_argument("--title", help="add-event のイベント名")
     parser.add_argument("--event-id", help="remove-event で消すイベントのID")
@@ -1594,6 +1643,21 @@ def main():
                 config_path.parent / "koebin-reviews.csv")
             count = export_reviews_csv(store, output, app_ids=app_ids)
             print("CSVを書き出しました: {}（{}件）".format(output, count))
+        finally:
+            store.close()
+        return 0
+
+    if args.command == "export-snapshots":
+        store = open_store(config, config_path.parent)
+        try:
+            if args.appid:
+                app_ids = [str(args.appid)]
+            else:
+                app_ids = [str(a) for a in config.get("app_ids", [])] or None
+            output = Path(args.output) if args.output else (
+                config_path.parent / "koebin-snapshots.csv")
+            count = export_snapshots_csv(store, output, app_ids=app_ids)
+            print("スナップショットをCSVに書き出しました: {}（{}件）".format(output, count))
         finally:
             store.close()
         return 0

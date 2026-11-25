@@ -28,6 +28,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import steam_review_notifier as notifier
+from steam_review_analytics import ReviewStore
 from steam_review_analytics import ReviewStore, backfill_history, evaluate_surge
 
 DAY = 86400
@@ -168,6 +169,31 @@ class SendFailureResendTest(_FixtureServerMixin, unittest.TestCase):
         self.assertEqual(len(received["Discord"]), 1)
         self.assertEqual(len(received["Slack"]), 1)
         self.assertIn("全滅レビュー", received["Discord"][0])
+
+
+class FetchOnlyCheckTest(_FixtureServerMixin, unittest.TestCase):
+    def test_check_once_with_no_destinations_stores_and_marks_seen(self):
+        _FixtureHandler.reviews = [make_review(1), make_review(2)]
+        store = ReviewStore(Path(self.tmp.name) / "fetch-only.db")
+        try:
+            notify = notifier.MultiNotifier([])
+            n = notifier.check_once(self.config, self.state_path, notify, store=store)
+            self.assertEqual(n, 0)  # 通知は0件（送っていない）
+            # 初回はベースラインとして既読に入り、再送待ちは残らない
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.assertIn("1", state.get("123", []))
+            self.assertIn("2", state.get("123", []))
+            self.assertNotIn(notifier.PENDING_KEY, state)
+            # 新着はDBへ保存され、既読に入る（次回も通知されない）
+            _FixtureHandler.reviews.insert(0, make_review(3, text="取得のみで保存される"))
+            n = notifier.check_once(self.config, self.state_path, notify, store=store)
+            self.assertEqual(n, 0)
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.assertIn("3", state.get("123", []))
+            self.assertNotIn(notifier.PENDING_KEY, state)
+            self.assertEqual(store.count_reviews("123"), 3)
+        finally:
+            store.close()
 
 
 class ErrorResponseBaselineTest(_FixtureServerMixin, unittest.TestCase):
@@ -331,6 +357,13 @@ class ValidateConfigTest(unittest.TestCase):
         cfg["discord_webhook_url"] = ""
         with self.assertRaises(ValueError):
             notifier.validate_config(cfg)
+
+    def test_no_webhook_with_fetch_only_ok(self):
+        cfg = self._base()
+        cfg["discord_webhook_url"] = ""
+        cfg["fetch_only"] = True
+        out = notifier.validate_config(cfg)
+        self.assertEqual(out["app_ids"], [123])
 
     def test_interval_out_of_range(self):
         cfg = self._base()
