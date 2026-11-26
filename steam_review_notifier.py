@@ -331,8 +331,12 @@ def fetch_app_name(appid, base_url=None):
     return "App {}".format(appid)
 
 
-# 取得の並びと API の filter 値の対応（2026-11-26 に実 API で確認）
-REVIEW_SORT_FILTERS = {"recent": 1, "helpful": 3}
+# 取得の並びと API の filter 値の対応。出典は Steamworks 公式文書
+# （IUserReviewsService の EUserReviewsAppReviewsFilter、2026-11-27 確認）：
+# 0=Helpful（day_range 内で参考になった順）／1=Recent／2=Updated／3=Funny。
+# v1.2.0 では実 API の出力だけで判断して helpful を 3 と取り違えた（3 は Funny で、
+# 上位レビューは参考になった数も多いため見分けが付かなかった）。公式文書で確認すること。
+REVIEW_SORT_FILTERS = {"recent": 1, "helpful": 0}
 
 
 def fetch_reviews_page(appid, cursor="*", num=100, base_url=None, sort="recent"):
@@ -341,7 +345,7 @@ def fetch_reviews_page(appid, cursor="*", num=100, base_url=None, sort="recent")
     sort は取得の並び（recent=新着順 / helpful=参考になった順）。
     2026-10-22に旧エンドポイント（store.steampowered.com/appreviews）が廃止され、
     IUserReviewsService/GetAppReviews に移行した。パラメータは input_json で渡し、
-    filter は数値（1=Recent、3=Helpful）、language は languages（配列）、
+    filter は数値（0=Helpful、1=Recent）、language は languages（配列）、
     purchase_type は数値（1=All）。
     レスポンスに success フィールドはない（HTTPステータスで判定する）。
 
@@ -352,16 +356,19 @@ def fetch_reviews_page(appid, cursor="*", num=100, base_url=None, sort="recent")
     if sort not in REVIEW_SORT_FILTERS:
         raise ValueError("未知の並びです: {}".format(sort))
     url = base_url or STEAM_REVIEWS_URL
-    input_json = json.dumps(
-        {
-            "appid": appid,
-            "filter": REVIEW_SORT_FILTERS[sort],
-            "languages": ["all"],
-            "purchase_type": 1,
-            "num_per_page": num,
-            "cursor": cursor,
-        }
-    )
+    params = {
+        "appid": appid,
+        "filter": REVIEW_SORT_FILTERS[sort],
+        "languages": ["all"],
+        "purchase_type": 1,
+        "num_per_page": num,
+        "cursor": cursor,
+    }
+    if sort == "helpful":
+        # Helpful は day_range（既定30日）の中で並ぶ。期間で区切らず
+        # 件数の上限で止める設計のため、0（無制限）を明示する（公式文書）
+        params["day_range"] = 0
+    input_json = json.dumps(params)
     data = http_get_json(url, {"input_json": input_json})
     # 実際の応答は {"response": {"reviews": [...]}} の形で包まれている（2026-11-20 実地確認）
     body = data.get("response", data)

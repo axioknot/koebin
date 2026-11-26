@@ -82,8 +82,15 @@ class FetchSortTest(unittest.TestCase):
     def test_recent_is_filter_1(self):
         self.assertEqual(self._capture()["filter"], 1)
 
-    def test_helpful_is_filter_3(self):
-        self.assertEqual(self._capture(sort="helpful")["filter"], 3)
+    def test_helpful_is_filter_0_with_unlimited_day_range(self):
+        # 公式文書の列挙（0=Helpful／1=Recent／3=Funny）。v1.2.0 で 3 と
+        # 取り違えた回帰の防止。helpful では day_range=0（無制限）も渡す
+        params = self._capture(sort="helpful")
+        self.assertEqual(params["filter"], 0)
+        self.assertEqual(params["day_range"], 0)
+
+    def test_recent_has_no_day_range(self):
+        self.assertNotIn("day_range", self._capture(sort="recent"))
 
     def test_unknown_sort_rejected(self):
         with self.assertRaises(ValueError):
