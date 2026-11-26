@@ -146,34 +146,77 @@ DEFAULT_TOPICS = {
     "enabled": True,
     # 論点の初期辞書（日英中）。config の analytics.topics.extra_keywords と
     # per_app_keywords（appid ごと）で、論点への語の追加や新しい論点の追加ができる
+    # テーマの範囲は、2026-11-22 の実測（低評価1,229件の分類と照合）で確認した
+    # 11テーマに合わせている。旧版の6テーマでは、低評価の73%がどのテーマにも
+    # 当たらず、テーマ内でも見逃しが多かった（記録は社内の測定資料）。
     "topics": {
-        "バグ・不具合": [
-            "バグ", "不具合", "クラッシュ", "フリーズ", "強制終了",
-            "bug", "crash", "glitch", "buggy", "闪退", "卡死", "漏洞",
+        "更新": [
+            "アップデート", "アプデ", "更新", "パッチ", "バージョンアップ",
+            "update", "patch", "dlc",
+            "补丁", "新版本", "版本更新",
         ],
-        "操作性": [
-            "操作性", "操作が", "キー配置", "コントローラー",
-            "controls", "controller", "clunky", "手感", "操作手感",
+        "MOD": [
+            "MOD", "mod", "mods", "modding", "nexus mods",
+            "模组", "创意工坊",
+        ],
+        "AI素材": [
+            "AI生成", "生成AI", "AIイラスト", "AIアート", "AI音楽", "AI素材",
+            "ai-generated", "ai generated", "ai art", "ai slop",
+            "generative", "genai", "ai usage",
+            "人工智能生成",
+        ],
+        "オンライン": [
+            "オンライン", "マルチプレイ", "協力プレイ", "サーバー", "ラグ",
+            "切断", "同期ずれ",
+            "online", "multiplayer", "server", "disconnect", "desync",
+            "联机", "服务器", "掉线",
+        ],
+        "バグ": [
+            "バグ", "不具合", "クラッシュ", "フリーズ", "強制終了",
+            "ソフトロック", "進行不能", "黒画面",
+            "bug", "crash", "glitch", "buggy", "softlock", "soft lock",
+            "soft locking", "soft-lock", "hitbox",
+            "black screen",
+            "闪退", "卡死", "漏洞", "黑屏", "卡住",
         ],
         "難易度": [
-            "難易度", "難しすぎ", "簡単すぎ", "バランス調整",
-            "difficulty", "too hard", "too easy", "unbalanced",
-            "难度", "太难", "太简单",
+            "難易度", "難しすぎ", "難しい", "簡単すぎ", "易しすぎ",
+            "バランス調整", "理不尽",
+            "difficulty", "too hard", "too easy", "too difficult", "unbalanced",
+            "unfair",
+            "难度", "太难", "太简单", "打不过", "过不去",
         ],
-        "翻訳・日本語": [
-            "翻訳", "誤訳", "日本語訳", "機械翻訳",
+        "ローカライズ": [
+            "翻訳", "誤訳", "日本語訳", "機械翻訳", "日本語化", "日本語対応",
+            "未翻訳", "文字化け",
             "translation", "localization", "machine translation",
-            "翻译", "机翻", "本地化",
+            "翻译", "机翻", "本地化", "汉化", "官中", "中文没了", "中文",
+            "英文", "语言",
         ],
-        "価格・ボリューム": [
-            "価格", "高すぎ", "ボリューム", "短すぎ", "コスパ",
+        "操作性": [
+            "操作性", "操作が", "操作", "キー配置", "コントローラー", "操作感",
+            "手柄",
+            "controls", "controller", "clunky", "key binds", "keybind",
+            "key mapping", "hit reg", "lock on",
+            "手感", "操作手感", "按键",
+        ],
+        "価格": [
+            "価格", "高すぎ", "短すぎ", "コスパ", "値段",
+            "割に合わない",
             "price", "overpriced", "too short",
             "价格", "太贵", "性价比", "内容量",
         ],
         "パフォーマンス": [
             "動作が重い", "重い", "カクカク", "フレームレート", "fps", "最適化",
             "performance", "laggy", "stutter", "optimization",
-            "卡顿", "掉帧", "优化",
+            "framerate", "frame rate", "low fps",
+            "卡顿", "掉帧", "帧率", "帧数", "不流畅",
+        ],
+        "設計": [
+            "つまらない", "退屈", "単調", "作業感", "作業ゲー", "繰り返し",
+            "マンネリ", "運ゲー", "面白くない",
+            "boring", "repetitive", "grind", "grindy", "tedious", "gameplay",
+            "单调", "无聊", "重复", "枯燥", "玩法",
         ],
     },
 }
@@ -208,10 +251,13 @@ def find_keyword_hit(text, keywords):
             continue
         k = str(kw).lower()
         if k.isascii():
+            # 境界は ASCII の英数字とアンダースコアを基準にする。Python の \b は
+            # 日本語・中国語の文字も単語文字とみなすため、「修bug」のように漢字に
+            # 隣接した英語キーワードが一致しなくなる（2026-11-22 の実測で確認）。
             if " " in k or "'" in k or "-" in k:
-                pattern = r"\b" + re.escape(k) + r"\b"
+                pattern = r"(?<![A-Za-z0-9_])" + re.escape(k) + r"(?![A-Za-z0-9_])"
             else:
-                pattern = r"\b" + re.escape(k) + r"\w*"
+                pattern = r"(?<![A-Za-z0-9_])" + re.escape(k) + r"\w*"
             for m in re.finditer(pattern, low):
                 if not _keyword_negated(low, m.start(), m.end(), k):
                     return kw
@@ -1271,9 +1317,10 @@ def build_player_lines(store, appid, now=None, days=7, cfg=None):
 
 
 DEFAULT_BACKFILL = {
-    "days": 90,            # さかのぼる日数
+    "days": 90,            # さかのぼる日数（並びが recent のときだけ効く）
     "max_reviews": 2000,   # 取り込む件数の上限（タイトルごと）
     "page_sleep_sec": 1.0, # ページ取得の間隔（レート制限への配慮）
+    "sort": "recent",      # 取得の並び（recent=新着順 / helpful=参考になった順）
 }
 
 
@@ -1290,7 +1337,9 @@ def backfill_history(store, appid, fetch_page, cfg=None, now=None, sleep=None):
     cfg = {**DEFAULT_BACKFILL, **(cfg or {})}
     sleep = sleep if sleep is not None else time.sleep
     now = int(now if now is not None else time.time())
-    cutoff = now - int(cfg["days"]) * DAY
+    # 参考になった順では投稿日時が前後するため、期間では区切らず件数で止める
+    sort = str(cfg.get("sort") or "recent")
+    cutoff = 0 if sort == "helpful" else now - int(cfg["days"]) * DAY
     max_reviews = int(cfg["max_reviews"])
 
     fetched = 0
@@ -1322,7 +1371,9 @@ def backfill_history(store, appid, fetch_page, cfg=None, now=None, sleep=None):
             status = "capped"
             reason = "上限 {} 件に達しました".format(max_reviews)
             break
-        if not page_reviews or oldest_ts < cutoff:
+        if not page_reviews:
+            break  # これ以上ページが無い
+        if sort != "helpful" and oldest_ts < cutoff:
             break  # 期間の末尾まで到達した
         if not next_cursor or next_cursor == cursor:
             break  # これ以上古いページが無い
@@ -1555,6 +1606,9 @@ def main():
     )
     parser.add_argument("--dry-run", action="store_true", help="送信せず標準出力に表示する")
     parser.add_argument("--force", action="store_true", help="backfill / import-history を実施済みでも再実行する")
+    parser.add_argument("--sort", choices=["recent", "helpful"], default=None, help="backfill の取得の並び（recent=新着順 / helpful=参考になった順）")
+    parser.add_argument("--max-reviews", type=int, default=None, help="backfill で取り込む件数の上限")
+    parser.add_argument("--days", type=int, default=None, help="backfill でさかのぼる日数（並びが recent のときだけ効く）")
     parser.add_argument("--appid", help="add-event / remove-event / export-csv / export-snapshots の対象タイトル")
     parser.add_argument("--output", help="export-csv / export-snapshots の書き出し先（省略時は config と同じ場所の koebin-reviews.csv / koebin-snapshots.csv）")
     parser.add_argument("--date", help="add-event の日付（YYYY-MM-DD）")
@@ -1665,12 +1719,20 @@ def main():
     if args.command == "backfill":
         store = open_store(config, config_path.parent)
         try:
-            bf_cfg = (config.get("analytics", {}) or {}).get("backfill")
+            bf_cfg = dict((config.get("analytics", {}) or {}).get("backfill") or {})
+            if args.sort:
+                bf_cfg["sort"] = args.sort
+            if args.max_reviews:
+                bf_cfg["max_reviews"] = args.max_reviews
+            if args.days:
+                bf_cfg["days"] = args.days
+            bf_sort = str(bf_cfg.get("sort") or "recent")
 
             def fetch_page(a, cursor):
                 return fetch_reviews_page(
                     a, cursor=cursor, num=100,
                     base_url=config.get("_reviews_base_url"),
+                    sort=bf_sort,
                 )
 
             for appid in config.get("app_ids", []):

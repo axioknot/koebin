@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 import threading
 import urllib.parse
 import webbrowser
@@ -29,14 +30,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from steam_review_notifier import (
+    MultiNotifier,
     acquire_lock,
     build_notifier,
     check_once,
+    fetch_reviews_page,
     validate_config,
 )
 from steam_review_analytics import (
+    backfill_history,
     build_digest_text,
     export_reviews_csv_text,
+    export_snapshots_csv,
     open_store,
 )
 
@@ -294,6 +299,91 @@ def job_test(config_path):
     for name, ok in results.items():
         print("{}: {}".format(name, "送信成功" if ok else "送信失敗"))
     return bool(results) and all(results.values())
+
+
+def job_collect_check(config_path):
+    """通知を送らずに、取得と蓄積だけを行うチェック（調査用）。
+
+    送信先が空の通知役で通常チェックを回す。挙動はコマンド側の
+    fetch_only と同じ（README の「通知せずに貯める（取得のみ）」節）。
+    """
+    config = _load_validated(config_path)
+    if config is None:
+        return False
+    notify = MultiNotifier([])
+    config_path = Path(config_path)
+    state_path = config_path.parent / config.get("state_file", "state.json")
+    lock_path = state_path.with_name(state_path.name + ".lock")
+    if not acquire_lock(lock_path):
+        print("既にチェックが実行中です（コマンド側で動いている場合も含みます）。")
+        return False
+    store = None
+    try:
+        analytics_cfg = config.get("analytics", {}) or {}
+        if analytics_cfg.get("enabled", True):
+            try:
+                store = open_store(config, config_path.parent)
+            except Exception as e:
+                print("[警告] 分析層のDBを開けませんでした: {}".format(e))
+                store = None
+        result = check_once(config, state_path, notify, store=store)
+        print(
+            "{} 取得のみチェック完了（新規に取り込んだレビュー {} 件）".format(
+                datetime.now().strftime("%H:%M:%S"), result.notified
+            )
+        )
+        if result.failed_apps:
+            print("[警告] {} 件のタイトルでレビュー取得に失敗しました".format(result.failed_apps))
+            return False
+        return True
+    finally:
+        if store is not None:
+            store.close()
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def make_backfill_job(sort="recent", max_reviews=None):
+    """過去分の一括取り込みを行うジョブを作る（ボタン押下＝明示の実施）。"""
+    def _job(config_path):
+        config = _load_validated(config_path)
+        if config is None:
+            return False
+        store = open_store(config, Path(config_path).parent)
+        try:
+            bf_cfg = dict((config.get("analytics", {}) or {}).get("backfill") or {})
+            if sort in ("recent", "helpful"):
+                bf_cfg["sort"] = sort
+            if max_reviews:
+                bf_cfg["max_reviews"] = max_reviews
+            bf_sort = str(bf_cfg.get("sort") or "recent")
+
+            def fetch_page(a, cursor):
+                return fetch_reviews_page(
+                    a, cursor=cursor, num=100,
+                    base_url=config.get("_reviews_base_url"),
+                    sort=bf_sort,
+                )
+
+            ok = True
+            for appid in config.get("app_ids", []):
+                appid = str(appid)
+                result = backfill_history(store, appid, fetch_page, cfg=bf_cfg)
+                print(
+                    "appid={}: {}（{}件{}）".format(
+                        appid, result["status"], result["fetched"],
+                        "、理由: " + result["reason"] if result["reason"] else "",
+                    )
+                )
+                if result["status"] == "partial":
+                    ok = False
+            return ok
+        finally:
+            store.close()
+
+    return _job
 
 
 def make_digest_send_job(app_id):
@@ -604,6 +694,33 @@ class App:
                 self.url("/download/csv"),
             )
         )
+        parts.append(
+            '<section><h2><span class="no">03</span><span class="en">COLLECT</span>集める（調査用）</h2>'
+            '<div class="actions equal">'
+            '<form method="post" action="{}"><button type="submit" class="subtle"{}>通知せずに取得する</button></form>'
+            '<a class="btn subtle" href="{}">スナップショットCSVをダウンロード</a>'
+            "</div>"
+            '<p class="note">通知せずに取得するチェックは、通知先が設定されていても送らず、'
+            "レビューを取り込んで蓄積します。以前に送れずに残っていた通知（再送待ち）がある場合は、"
+            "送られないまま再送待ちから外れます。</p>"
+            '<form method="post" action="{}">'
+            '<label class="f" for="f-bf-sort">過去分を取り込むときの並び</label>'
+            '<select name="sort" id="f-bf-sort">'
+            '<option value="recent">新着順</option>'
+            '<option value="helpful">参考になった順</option>'
+            "</select>"
+            '<label class="f" for="f-bf-max">取り込む件数の上限（タイトルごと）</label>'
+            '<input name="max_reviews" id="f-bf-max" inputmode="numeric" placeholder="2000">'
+            '<div class="actions" style="margin-top:16px">'
+            '<button type="submit" class="subtle"{}>過去分を取り込む</button></div></form>'
+            '<p class="note">過去分の取り込みは、監視を始める前のレビューをさかのぼって蓄積します。'
+            "参考になった順では、期間ではなく件数の上限で止まります。</p>"
+            "</section>".format(
+                self.url("/action/collect-check"), disabled,
+                self.url("/download/snapshots"),
+                self.url("/action/backfill"), disabled,
+            )
+        )
         parts.append(self.job_area(self.url("/")))
         parts.append(self.footer())
         return self.layout("こえびん", "".join(parts), job_watch=self.job.running)
@@ -816,6 +933,8 @@ class Handler(BaseHTTPRequestHandler):
             self._html(app.page_settings())
         elif parsed.path == "/download/csv":
             self._download_csv()
+        elif parsed.path == "/download/snapshots":
+            self._download_snapshots()
         else:
             self._send(404, "text/plain; charset=utf-8", "Not Found")
 
@@ -835,6 +954,24 @@ class Handler(BaseHTTPRequestHandler):
             self._redirect(app.url("/"))
         elif parsed.path == "/action/test":
             app.job.start("テスト通知", job_test, app.config_path)
+            self._redirect(app.url("/"))
+        elif parsed.path == "/action/collect-check":
+            app.job.start("取得のみチェック", job_collect_check, app.config_path)
+            self._redirect(app.url("/"))
+        elif parsed.path == "/action/backfill":
+            sort = form.get("sort") or "recent"
+            if sort not in ("recent", "helpful"):
+                sort = "recent"
+            try:
+                max_reviews = int(form.get("max_reviews") or "")
+            except ValueError:
+                max_reviews = None
+            if max_reviews is not None and max_reviews <= 0:
+                max_reviews = None
+            app.job.start(
+                "過去分の取り込み", make_backfill_job(sort, max_reviews),
+                app.config_path,
+            )
             self._redirect(app.url("/"))
         elif parsed.path == "/action/digest-send":
             app_id = form.get("app") or ""
@@ -876,6 +1013,38 @@ class Handler(BaseHTTPRequestHandler):
             "text/csv; charset=utf-8",
             data,
             {"Content-Disposition": 'attachment; filename="koebin-reviews.csv"'},
+        )
+
+
+    def _download_snapshots(self):
+        app = self.app
+        config = app.config()
+        if config is None:
+            self._send(400, "text/plain; charset=utf-8", "設定ファイルがありません")
+            return
+        try:
+            validated = validate_config(copy.deepcopy(config))
+        except ValueError:
+            validated = config
+        store = open_store(validated, app.config_path.parent)
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".csv")
+            os.close(fd)
+            export_snapshots_csv(store, tmp)
+            data = Path(tmp).read_bytes()
+        finally:
+            store.close()
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        self._send(
+            200,
+            "text/csv; charset=utf-8",
+            data,
+            {"Content-Disposition": 'attachment; filename="koebin-snapshots.csv"'},
         )
 
 

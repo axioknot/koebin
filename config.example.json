@@ -20,7 +20,8 @@
     "backfill": {
       "days": 90,
       "max_reviews": 2000,
-      "page_sleep_sec": 1.0
+      "page_sleep_sec": 1.0,
+      "sort": "recent"
     },
     "events": {
       "enabled": true,

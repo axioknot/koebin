@@ -331,23 +331,31 @@ def fetch_app_name(appid, base_url=None):
     return "App {}".format(appid)
 
 
-def fetch_reviews_page(appid, cursor="*", num=100, base_url=None):
+# 取得の並びと API の filter 値の対応（2026-11-26 に実 API で確認）
+REVIEW_SORT_FILTERS = {"recent": 1, "helpful": 3}
+
+
+def fetch_reviews_page(appid, cursor="*", num=100, base_url=None, sort="recent"):
     """レビューを1ページ分取得する。(レビューのリスト, 次ページのカーソル) を返す。
 
+    sort は取得の並び（recent=新着順 / helpful=参考になった順）。
     2026-10-22に旧エンドポイント（store.steampowered.com/appreviews）が廃止され、
     IUserReviewsService/GetAppReviews に移行した。パラメータは input_json で渡し、
-    filter は数値（1=Recent）、language は languages（配列）、purchase_type は数値（1=All）。
+    filter は数値（1=Recent、3=Helpful）、language は languages（配列）、
+    purchase_type は数値（1=All）。
     レスポンスに success フィールドはない（HTTPステータスで判定する）。
 
     HTTP 200 でも `reviews` キーが無い応答は「新着0件」ではなくエラーとして扱う
     （仕様変更やエラー応答を静かに飲み込むと、初回に空のベースラインが記録され、
     次回に過去分が一斉通知される事故になるため）。
     """
+    if sort not in REVIEW_SORT_FILTERS:
+        raise ValueError("未知の並びです: {}".format(sort))
     url = base_url or STEAM_REVIEWS_URL
     input_json = json.dumps(
         {
             "appid": appid,
-            "filter": 1,
+            "filter": REVIEW_SORT_FILTERS[sort],
             "languages": ["all"],
             "purchase_type": 1,
             "num_per_page": num,
@@ -1257,7 +1265,11 @@ def _retry_pending(state, notify):
                 seen_list = state.setdefault(appid, [])
                 if rid not in seen_list:
                     seen_list.append(rid)
-                print("[再送完了] appid={} レビュー {} を届けました".format(appid, rid))
+                if isinstance(notify, MultiNotifier) and not notify.destinations:
+                    # 送信先が無い（取得のみ等）場合は、届けたわけではないので分けて表示する
+                    print("[再送待ち解除] appid={} レビュー {} は、送信先がないため送らずに再送待ちから外しました".format(appid, rid))
+                else:
+                    print("[再送完了] appid={} レビュー {} を届けました".format(appid, rid))
         if not entries:
             del pending[appid]
     if not pending:
