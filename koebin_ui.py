@@ -40,9 +40,11 @@ from steam_review_notifier import (
 from steam_review_analytics import (
     backfill_history,
     build_digest_text,
+    cross_title_summary,
     export_reviews_csv_text,
     export_snapshots_csv,
     open_store,
+    snapshot_series,
 )
 
 TEST_MESSAGE = "【テスト通知】こえびん\nこのメッセージが届いていれば、通知設定は正常です。"
@@ -439,6 +441,17 @@ h2 { font-size: 14px; letter-spacing: .04em; line-height: 1.4; color: #1C1C1C; f
 h2 .no { color: #072A7C; font-size: 12px; margin-right: 8px; }
 h2 .en { color: #57534B; font-size: 12px; font-weight: 400; letter-spacing: .1em; margin-right: 8px; }
 .tblabel { font-size: 12px; color: #57534B; margin: 16px 0 8px; }
+.period { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+.period a { border: 1px solid #8F887C; color: #1C1C1C; padding: 6px 12px; font-size: 13px;
+  text-decoration: none; border-radius: 3px; min-height: 32px; display: inline-flex; align-items: center;
+  box-sizing: border-box; }
+.period a[aria-current="page"] { background: #1C1C1C; border-color: #1C1C1C; color: #FAFAF7; font-weight: 700; }
+.up { color: #A33B1F; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.chart { margin: 0 0 20px; }
+.chart h3 { font-size: 14px; margin: 0 0 4px; }
+.chart .meta { color: #57534B; font-size: 12px; margin: 0 0 6px; }
+.phase2 { border: 1px dashed #8F887C; padding: 12px 16px; color: #57534B; font-size: 14px; }
 .tblabel.first { margin-top: 0; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 table.fixed { table-layout: fixed; }
@@ -517,6 +530,66 @@ def linkify(text):
     return _URL_RE.sub(repl, esc(text))
 
 
+def _svg_chart(series_list, events=(), width=832, height=120):
+    """推移グラフの SVG を組み立てる。
+
+    series_list は (points, attrs) の並びで、points は (ts, value) の列
+    （value が None の点は飛ばす）。各系列は自分の最小・最大で縦に広げる。
+    events は (ts, label) の列で、範囲内なら縦線とラベルを重ねる。
+    点が2つ未満の系列しか無い場合は空文字を返す。
+    """
+    cleaned = []
+    all_ts = []
+    for item in series_list:
+        points, attrs = item[0], item[1]
+        vrange = item[2] if len(item) > 2 else None
+        pts = [(ts, v) for ts, v in points if v is not None]
+        if len(pts) >= 2:
+            cleaned.append((pts, attrs, vrange))
+            all_ts.extend(ts for ts, _ in pts)
+    if not cleaned:
+        return ""
+    t_min, t_max = min(all_ts), max(all_ts)
+    span_t = (t_max - t_min) or 1
+
+    def x_of(ts):
+        return 4 + (ts - t_min) / span_t * (width - 8)
+
+    out = [
+        '<svg width="100%" viewBox="0 0 {} {}" role="img" aria-label="推移グラフ">'.format(
+            width, height
+        )
+    ]
+    top, bottom = 22, height - 10
+    for ts, label in events:
+        if t_min <= ts <= t_max:
+            x = x_of(ts)
+            out.append(
+                '<line x1="{:.0f}" y1="{}" x2="{:.0f}" y2="{}" stroke="#A33B1F" stroke-width="1.5"/>'
+                '<text x="{:.0f}" y="14" font-size="11" fill="#A33B1F">{}</text>'.format(
+                    x, top - 6, x, bottom, min(x + 6, width - 190), esc(label)
+                )
+            )
+    for pts, attrs, vrange in cleaned:
+        if vrange is not None:
+            v_min, v_max = vrange
+        else:
+            values = [v for _, v in pts]
+            v_min, v_max = min(values), max(values)
+        span_v = (v_max - v_min) or 1
+        coords = " ".join(
+            "{:.0f},{:.0f}".format(
+                x_of(ts), bottom - (v - v_min) / span_v * (bottom - top)
+            )
+            for ts, v in pts
+        )
+        out.append(
+            '<polyline fill="none" points="{}" {}/>'.format(coords, attrs)
+        )
+    out.append("</svg>")
+    return "".join(out)
+
+
 class App:
     def __init__(self, config_path, token):
         self.config_path = Path(config_path)
@@ -589,6 +662,7 @@ class App:
         for key, label, path in (
             ("top", "トップ", "/"),
             ("digest", "週次まとめ", "/digest"),
+            ("analysis", "分析", "/analysis"),
             ("settings", "設定", "/settings"),
         ):
             if key == current:
@@ -795,6 +869,190 @@ class App:
         parts.append(self.footer())
         return self.layout("週次まとめ", "".join(parts), job_watch=self.job.running)
 
+
+    def page_analysis(self, days_param=None, metric=None):
+        config = self.config()
+        parts = [
+            self.header(
+                "分析",
+                "集めたレビューと日次の記録から、タイトルを横断して見ます。表示はこの場で集計していて、新しい記録は作りません。",
+                "analysis",
+            )
+        ]
+        if config is None:
+            parts.append(
+                '<div class="banner">設定ファイルがありません。先に <a href="{}">設定画面</a> で保存してください。</div>'.format(
+                    self.url("/settings")
+                )
+            )
+            parts.append(self.footer())
+            return self.layout("分析", "".join(parts))
+        days = {"7": 7, "all": None}.get(days_param, 30)
+        metric = metric if metric in ("total", "players", "discount") else "total"
+        app_ids = [str(a) for a in config.get("app_ids", [])]
+        store = self.store_if_exists(config)
+        parts.append(
+            '<section><h2><span class="no">01</span><span class="en">OVERVIEW</span>タイトル横断の論点</h2>'
+        )
+        period_links = []
+        for label, value in (("直近7日", "7"), ("直近30日", "30"), ("全期間", "all")):
+            current = (
+                (days == 7 and value == "7")
+                or (days == 30 and value == "30")
+                or (days is None and value == "all")
+            )
+            period_links.append(
+                '<a href="{}"{}>{}</a>'.format(
+                    self.url("/analysis", days=value, metric=metric),
+                    ' aria-current="page"' if current else "",
+                    label,
+                )
+            )
+        parts.append('<div class="period">{}</div>'.format("".join(period_links)))
+        if store is None:
+            parts.append(
+                '<p class="note">レビュー履歴がまだありません。先にチェックを実行してください。</p></section>'
+            )
+            parts.append(self.footer())
+            return self.layout("分析", "".join(parts))
+        try:
+            rows = cross_title_summary(store, app_ids, days=days, config=config)
+            trs = []
+            for row in rows:
+                topics = " ／ ".join(
+                    "{} {}{}".format(
+                        esc(t["name"]),
+                        t["down"],
+                        ' <span class="up" title="前の期間より増えています">▲</span>'
+                        if t["rose"]
+                        else "",
+                    )
+                    for t in row["top_topics"]
+                ) or "—"
+                ratio = (
+                    "{:.1f}%".format(row["down_ratio"] * 100)
+                    if row["down_ratio"] is not None
+                    else "—"
+                )
+                trs.append(
+                    "<tr><td>{}</td>"
+                    '<td class="num">{}</td><td class="num">{}</td>'
+                    '<td class="num">{}</td><td>{}</td></tr>'.format(
+                        esc(row["name"]),
+                        row["total"],
+                        row["down"],
+                        ratio,
+                        topics,
+                    )
+                )
+            parts.append(
+                "<table><tr><th>タイトル</th><th class=\"num\">レビュー</th><th class=\"num\">低評価</th>"
+                "<th class=\"num\">低評価率</th><th>多い論点（低評価）</th></tr>{}</table>".format(
+                    "".join(trs)
+                )
+            )
+            parts.append(
+                '<p class="note">論点の件数はキーワードの一致で数えた目安です。▲は、前の同じ長さの期間より低評価の件数が増えた論点です。</p></section>'
+            )
+            # ---- 推移 -------------------------------------------------
+            parts.append(
+                '<section><h2><span class="no">02</span><span class="en">TRENDS</span>推移</h2>'
+            )
+            metric_links = []
+            for label, value in (
+                ("レビュー総数と好評率", "total"),
+                ("同時プレイヤー数", "players"),
+                ("割引率", "discount"),
+            ):
+                metric_links.append(
+                    '<a href="{}"{}>{}</a>'.format(
+                        self.url(
+                            "/analysis",
+                            days=("all" if days is None else str(days)),
+                            metric=value,
+                        ),
+                        ' aria-current="page"' if metric == value else "",
+                        label,
+                    )
+                )
+            parts.append(
+                '<div class="period">{}</div>'.format("".join(metric_links))
+            )
+            any_chart = False
+            for row in rows:
+                series = snapshot_series(store, row["appid"])
+                if metric == "total":
+                    series_list = [
+                        (
+                            [(x["ts"], x["total_reviews"]) for x in series],
+                            'stroke="#072A7C" stroke-width="2"',
+                        ),
+                        (
+                            [
+                                (
+                                    x["ts"],
+                                    x["up_ratio"] * 100
+                                    if x["up_ratio"] is not None
+                                    else None,
+                                )
+                                for x in series
+                            ],
+                            'stroke="#8A8578" stroke-width="1.5" stroke-dasharray="4 3"',
+                            (0, 100),
+                        ),
+                    ]
+                    meta = "実線がレビュー総数、破線が好評率（%）です。縦線は公式発表のあった日です。"
+                elif metric == "players":
+                    series_list = [
+                        (
+                            [(x["ts"], x["player_count"]) for x in series],
+                            'stroke="#072A7C" stroke-width="2"',
+                        )
+                    ]
+                    meta = "同時プレイヤー数です。縦線は公式発表のあった日です。"
+                else:
+                    series_list = [
+                        (
+                            [(x["ts"], x["discount_percent"]) for x in series],
+                            'stroke="#072A7C" stroke-width="2"',
+                        )
+                    ]
+                    meta = "割引率（%）です。縦線は公式発表のあった日です。"
+                events = []
+                if series:
+                    t_lo = min(x["ts"] for x in series)
+                    t_hi = max(x["ts"] for x in series)
+                    for ev in store.list_events(row["appid"]):
+                        if t_lo <= ev["event_ts"] <= t_hi:
+                            label = "{} {}".format(
+                                datetime.fromtimestamp(ev["event_ts"]).strftime(
+                                    "%m/%d"
+                                ),
+                                (ev.get("title") or "")[:18],
+                            )
+                            events.append((ev["event_ts"], label))
+                chart = _svg_chart(series_list, events=events)
+                if chart:
+                    any_chart = True
+                    parts.append(
+                        '<div class="chart"><h3>{}</h3><p class="meta">{}</p>{}</div>'.format(
+                            esc(row["name"]), meta, chart
+                        )
+                    )
+            if not any_chart:
+                parts.append(
+                    '<p class="note">推移を描ける記録がまだありません。日次の記録が2日分たまると表示されます。</p>'
+                )
+            parts.append("</section>")
+        finally:
+            store.close()
+        parts.append(
+            '<section><h2><span class="no">03</span><span class="en">COMPARE</span>イベント前後の比較</h2>'
+            '<div class="phase2">次の更新で追加します。公式発表を選ぶと、その前後7日ずつで、レビュー件数・好評率・論点の内訳の変化を見られるようにします。</div></section>'
+        )
+        parts.append(self.footer())
+        return self.layout("分析", "".join(parts))
+
     def page_settings(self, values=None, errors=None, saved=False):
         config = self.config()
         base = config if config is not None else default_config()
@@ -936,6 +1194,13 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif parsed.path == "/digest":
             self._html(app.page_digest((params.get("app") or [None])[0]))
+        elif parsed.path == "/analysis":
+            self._html(
+                app.page_analysis(
+                    (params.get("days") or [None])[0],
+                    (params.get("metric") or [None])[0],
+                )
+            )
         elif parsed.path == "/settings":
             self._html(app.page_settings())
         elif parsed.path == "/download/csv":

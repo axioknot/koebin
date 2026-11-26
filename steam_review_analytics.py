@@ -991,6 +991,83 @@ def build_digest_text(store, appid, app_name, now=None, days=7, config=None):
     return "\n".join(lines)
 
 
+def cross_title_summary(store, app_ids, now=None, days=30, config=None):
+    """分析画面用：タイトル横断の集計を返す。
+
+    期間（days=None で全期間）について、タイトルごとにレビュー件数・低評価
+    件数・低評価率と、低評価の中で多い論点（上位3つ、前の同じ長さの期間より
+    増えたかどうかの印つき）を返す。論点の数え方は週次ダイジェストと
+    同じ部品（resolve_topic_dict／count_topics）を使う。
+    """
+    now = int(now if now is not None else time.time())
+    analytics_cfg = (config or {}).get("analytics", {}) or {}
+    topics_cfg = analytics_cfg.get("topics")
+    rows = []
+    for appid in app_ids:
+        if days:
+            cur_reviews = store.reviews_between(appid, now - days * DAY, now)
+            prev_reviews = store.reviews_between(
+                appid, now - 2 * days * DAY, now - days * DAY
+            )
+        else:
+            cur_reviews = store.reviews_between(appid, 0, now)
+            prev_reviews = []
+        stats = window_stats(cur_reviews)
+        topics = resolve_topic_dict(topics_cfg, appid=appid)
+        counts = count_topics(cur_reviews, topics)
+        prev_counts = count_topics(prev_reviews, topics) if prev_reviews else {}
+        top = sorted(
+            (
+                {
+                    "name": name,
+                    "down": c["down"],
+                    "rose": bool(days)
+                    and c["down"] > (prev_counts.get(name) or {}).get("down", 0),
+                }
+                for name, c in counts.items()
+                if c["down"] > 0
+            ),
+            key=lambda t: (-t["down"], t["name"]),
+        )[:3]
+        rows.append(
+            {
+                "appid": appid,
+                "name": store.get_app_name(appid) or "App {}".format(appid),
+                "total": stats["total"],
+                "down": stats["down"],
+                "down_ratio": (stats["down"] / stats["total"])
+                if stats["total"]
+                else None,
+                "top_topics": top,
+            }
+        )
+    return rows
+
+
+def snapshot_series(store, appid):
+    """分析画面の推移表示用：スナップショットを記録日時の古い順に返す。
+
+    各要素は ts／total_reviews／up_ratio（好評率、総数が無いときは None）／
+    player_count／discount_percent。記録が無い項目は None のまま返す。
+    """
+    out = []
+    for snap in store.iter_snapshots(appid):
+        total = snap.get("total_reviews")
+        positive = snap.get("total_positive")
+        out.append(
+            {
+                "ts": snap.get("ts"),
+                "total_reviews": total,
+                "up_ratio": (positive / total)
+                if (total and positive is not None)
+                else None,
+                "player_count": snap.get("player_count"),
+                "discount_percent": snap.get("discount_percent"),
+            }
+        )
+    return out
+
+
 def evaluate_surge(store, appid, cfg=None, now=None):
     """急増判定。アラートすべきなら根拠の辞書を、そうでなければ None を返す。
 
