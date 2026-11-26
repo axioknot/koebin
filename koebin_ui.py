@@ -232,7 +232,7 @@ class JobState:
             self.finished_at = datetime.now().strftime("%H:%M:%S")
 
 
-def _load_validated(config_path):
+def _load_validated(config_path, allow_no_notifier=False):
     raw = load_config_raw(config_path)
     if raw is None:
         print("設定ファイルが見つからないか、読み込めません: {}".format(config_path))
@@ -240,6 +240,13 @@ def _load_validated(config_path):
     try:
         return validate_config(raw)
     except ValueError as e:
+        if allow_no_notifier:
+            # 集める系の操作は通知を送らないので、通知先が未設定でも
+            # 取得のみとして読み込む（コマンド側の fetch_only と同じ扱い）
+            try:
+                return validate_config(dict(raw, fetch_only=True))
+            except ValueError:
+                pass
         for line in str(e).splitlines():
             print("[設定エラー] {}".format(line))
         return None
@@ -307,7 +314,7 @@ def job_collect_check(config_path):
     送信先が空の通知役で通常チェックを回す。挙動はコマンド側の
     fetch_only と同じ（README の「通知せずに貯める（取得のみ）」節）。
     """
-    config = _load_validated(config_path)
+    config = _load_validated(config_path, allow_no_notifier=True)
     if config is None:
         return False
     notify = MultiNotifier([])
@@ -348,7 +355,7 @@ def job_collect_check(config_path):
 def make_backfill_job(sort="recent", max_reviews=None):
     """過去分の一括取り込みを行うジョブを作る（ボタン押下＝明示の実施）。"""
     def _job(config_path):
-        config = _load_validated(config_path)
+        config = _load_validated(config_path, allow_no_notifier=True)
         if config is None:
             return False
         store = open_store(config, Path(config_path).parent)

@@ -965,15 +965,19 @@ def _maybe_backfill(config, store, appid):
         if store.get_meta("backfill:{}".format(appid)) is not None:
             return
         base_url = config.get("_reviews_base_url")
+        bf_cfg = (config.get("analytics", {}) or {}).get("backfill") or {}
+        sort = bf_cfg.get("sort", "recent")
 
         def fetch_page(a, cursor):
-            return fetch_reviews_page(a, cursor=cursor, num=100, base_url=base_url)
+            return fetch_reviews_page(
+                a, cursor=cursor, num=100, base_url=base_url, sort=sort
+            )
 
         result = backfill_history(
             store,
             appid,
             fetch_page,
-            cfg=(config.get("analytics", {}) or {}).get("backfill"),
+            cfg=bf_cfg,
         )
         if result.get("status") != "complete":
             print(

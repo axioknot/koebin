@@ -275,3 +275,39 @@ class UiCollectHttpTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutoBackfillSortTest(unittest.TestCase):
+    def test_maybe_backfill_passes_sort_to_fetch(self):
+        import steam_review_notifier as notifier
+
+        store = mock.Mock()
+        store.get_meta.return_value = None
+        captured = {}
+
+        def fake_backfill(store_, appid, fetch_page, cfg=None):
+            captured["cfg"] = cfg
+            captured["page"] = fetch_page(appid, "*")
+            return {"status": "complete", "fetched": 0}
+
+        config = {"analytics": {"backfill": {"sort": "helpful", "days": 90}}}
+        with mock.patch.object(notifier, "backfill_history", side_effect=fake_backfill), \
+             mock.patch.object(notifier, "fetch_reviews_page", return_value=([], "*")) as fp:
+            notifier._maybe_backfill(config, store, 123)
+        self.assertEqual(fp.call_args.kwargs.get("sort"), "helpful")
+        self.assertEqual(captured["cfg"]["sort"], "helpful")
+
+
+class CollectJobNoNotifierTest(unittest.TestCase):
+    def test_collect_check_runs_without_notifier_or_fetch_only(self):
+        with TemporaryDirectory() as td:
+            cfg_path = Path(td) / "config.json"
+            cfg_path.write_text(json.dumps({
+                "app_ids": [123],
+                "webhook_urls": [],
+                "analytics": {"enabled": False},
+            }), encoding="utf-8")
+            with mock.patch.object(koebin_ui, "check_once", return_value=SimpleNamespace(notified=0, failed_apps=0)) as co:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    koebin_ui.job_collect_check(str(cfg_path))
+        self.assertTrue(co.called)
