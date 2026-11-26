@@ -41,6 +41,7 @@ from steam_review_analytics import (
     backfill_history,
     build_digest_text,
     cross_title_summary,
+    event_comparison,
     export_reviews_csv_text,
     export_snapshots_csv,
     open_store,
@@ -870,7 +871,7 @@ class App:
         return self.layout("週次まとめ", "".join(parts), job_watch=self.job.running)
 
 
-    def page_analysis(self, days_param=None, metric=None):
+    def page_analysis(self, days_param=None, metric=None, event_param=None):
         config = self.config()
         parts = [
             self.header(
@@ -901,9 +902,12 @@ class App:
                 or (days == 30 and value == "30")
                 or (days is None and value == "all")
             )
+            link_params = {"days": value, "metric": metric}
+            if event_param:
+                link_params["event"] = event_param
             period_links.append(
                 '<a href="{}"{}>{}</a>'.format(
-                    self.url("/analysis", days=value, metric=metric),
+                    self.url("/analysis", **link_params),
                     ' aria-current="page"' if current else "",
                     label,
                 )
@@ -964,13 +968,15 @@ class App:
                 ("同時プレイヤー数", "players"),
                 ("割引率", "discount"),
             ):
+                link_params = {
+                    "days": ("all" if days is None else str(days)),
+                    "metric": value,
+                }
+                if event_param:
+                    link_params["event"] = event_param
                 metric_links.append(
                     '<a href="{}"{}>{}</a>'.format(
-                        self.url(
-                            "/analysis",
-                            days=("all" if days is None else str(days)),
-                            metric=value,
-                        ),
+                        self.url("/analysis", **link_params),
                         ' aria-current="page"' if metric == value else "",
                         label,
                     )
@@ -1046,10 +1052,127 @@ class App:
             parts.append("</section>")
         finally:
             store.close()
+        # ---- イベント前後の比較 -------------------------------------
         parts.append(
             '<section><h2><span class="no">03</span><span class="en">COMPARE</span>イベント前後の比較</h2>'
-            '<div class="phase2">次の更新で追加します。公式発表を選ぶと、その前後7日ずつで、レビュー件数・好評率・論点の内訳の変化を見られるようにします。</div></section>'
         )
+        store2 = self.store_if_exists(config)
+        if store2 is None:
+            parts.append(
+                '<p class="note">レビュー履歴がまだありません。先にチェックを実行してください。</p></section>'
+            )
+            parts.append(self.footer())
+            return self.layout("分析", "".join(parts))
+        try:
+            all_events = []
+            for row in rows:
+                for ev in store2.list_events(row["appid"]):
+                    all_events.append((row, ev))
+            all_events.sort(key=lambda pair: -int(pair[1]["event_ts"]))
+            all_events = all_events[:12]
+            if not all_events:
+                parts.append(
+                    '<p class="note">公式発表の記録がまだありません。チェックを続けると、公式発表が記録されて、ここで選べるようになります。</p></section>'
+                )
+            else:
+                selected = None
+                if event_param and ":" in event_param:
+                    sel_app, sel_id = event_param.split(":", 1)
+                    for row, ev in all_events:
+                        if str(row["appid"]) == sel_app and ev.get("event_id") == sel_id:
+                            selected = (row, ev)
+                            break
+                if selected is None:
+                    selected = all_events[0]
+                sel_row, sel_ev = selected
+                ev_links = []
+                for row, ev in all_events:
+                    label = "{} {} {}".format(
+                        row["name"],
+                        datetime.fromtimestamp(int(ev["event_ts"])).strftime("%m/%d"),
+                        (ev.get("title") or "")[:16],
+                    )
+                    is_current = (
+                        str(row["appid"]) == str(sel_row["appid"])
+                        and ev.get("event_id") == sel_ev.get("event_id")
+                    )
+                    ev_links.append(
+                        '<a href="{}"{}>{}</a>'.format(
+                            self.url(
+                                "/analysis",
+                                days=("all" if days is None else str(days)),
+                                metric=metric,
+                                event="{}:{}".format(row["appid"], ev.get("event_id")),
+                            ),
+                            ' aria-current="page"' if is_current else "",
+                            esc(label),
+                        )
+                    )
+                parts.append(
+                    '<div class="period">{}</div>'.format("".join(ev_links))
+                )
+                comp = event_comparison(
+                    store2,
+                    sel_row["appid"],
+                    event_id=sel_ev.get("event_id"),
+                    config=config,
+                )
+                if comp is not None:
+                    def ratio_txt(v):
+                        return "{:.1f}%".format(v * 100) if v is not None else "—"
+
+                    b, a = comp["before"], comp["after"]
+                    parts.append(
+                        "<table><tr><th></th>"
+                        '<th class="num">レビュー</th><th class="num">好評</th>'
+                        '<th class="num">低評価</th><th class="num">好評率</th></tr>'
+                        "<tr><td>前（{}日）</td>"
+                        '<td class="num">{}</td><td class="num">{}</td>'
+                        '<td class="num">{}</td><td class="num">{}</td></tr>'
+                        "<tr><td>後（{}日）</td>"
+                        '<td class="num">{}</td><td class="num">{}</td>'
+                        '<td class="num">{}</td><td class="num">{}</td></tr>'
+                        "</table>".format(
+                            comp["days"],
+                            b["total"], b["up"], b["down"], ratio_txt(b["up_ratio"]),
+                            comp["days"],
+                            a["total"], a["up"], a["down"], ratio_txt(a["up_ratio"]),
+                        )
+                    )
+                    if comp["partial"]:
+                        parts.append(
+                            '<p class="note">イベント後はまだ{}日分そろっていません。後の数字は集計途中です。</p>'.format(
+                                comp["days"]
+                            )
+                        )
+                    topic_trs = []
+                    for t in comp["topics"][:5]:
+                        delta = t["after_down"] - t["before_down"]
+                        topic_trs.append(
+                            "<tr><td>{}</td>"
+                            '<td class="num">{}</td><td class="num">{}</td>'
+                            '<td class="num">{}</td></tr>'.format(
+                                esc(t["name"]),
+                                t["before_down"],
+                                t["after_down"],
+                                ("+{}".format(delta) if delta > 0 else str(delta)),
+                            )
+                        )
+                    if topic_trs:
+                        parts.append(
+                            '<p class="tblabel">低評価の論点の内訳（前→後）</p>'
+                            "<table><tr><th>論点</th>"
+                            '<th class="num">前</th><th class="num">後</th>'
+                            '<th class="num">増減</th></tr>{}</table>'.format(
+                                "".join(topic_trs)
+                            )
+                        )
+                    parts.append(
+                        '<p class="note">論点の件数はキーワードの一致で数えた目安です。</p>'
+                    )
+                parts.append("</section>")
+        finally:
+            store2.close()
         parts.append(self.footer())
         return self.layout("分析", "".join(parts))
 
@@ -1199,6 +1322,7 @@ class Handler(BaseHTTPRequestHandler):
                 app.page_analysis(
                     (params.get("days") or [None])[0],
                     (params.get("metric") or [None])[0],
+                    (params.get("event") or [None])[0],
                 )
             )
         elif parsed.path == "/settings":

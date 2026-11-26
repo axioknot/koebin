@@ -16,10 +16,11 @@ DAY = 86400
 class FakeStore:
     """reviews_between／get_app_name／iter_snapshots だけを持つ簡易ストア。"""
 
-    def __init__(self, reviews, names=None, snapshots=None):
+    def __init__(self, reviews, names=None, snapshots=None, events=None):
         self.reviews = reviews  # {appid: [row,...]}
         self.names = names or {}
         self.snapshots = snapshots or {}
+        self.events = events or {}
 
     def reviews_between(self, appid, start_ts, end_ts):
         return [
@@ -33,6 +34,18 @@ class FakeStore:
 
     def iter_snapshots(self, appid):
         return list(self.snapshots.get(str(appid), []))
+
+    def list_events(self, appid):
+        return sorted(
+            self.events.get(str(appid), []),
+            key=lambda e: -e["event_ts"],
+        )
+
+    def latest_event(self, appid, at_or_before=None):
+        for ev in self.list_events(appid):
+            if at_or_before is None or ev["event_ts"] <= at_or_before:
+                return ev
+        return None
 
 
 def review(text, voted_up, ts):
@@ -155,6 +168,7 @@ class AnalysisPageTests(unittest.TestCase):
             "100", ts=now - DAY, total_reviews=120, total_positive=90,
             total_negative=30, player_count=12, discount_percent=10,
         )
+        store.upsert_event("100", "ev1", "アップデート1.1", now - 3 * DAY)
         store.close()
         config = {
             "app_ids": [100],
@@ -175,6 +189,9 @@ class AnalysisPageTests(unittest.TestCase):
         self.assertIn("バグ 2", html_out)
         self.assertIn("<svg", html_out)
         self.assertIn("イベント前後の比較", html_out)
+        self.assertIn("アップデート1.1", html_out)
+        self.assertIn("前（7日）", html_out)
+        self.assertIn("後（7日）", html_out)
         # ナビに分析が入り、現在ページになる
         self.assertIn('aria-current="page">分析</a>', html_out)
 
@@ -187,3 +204,41 @@ class AnalysisPageTests(unittest.TestCase):
         app2 = self.koebin_ui.App(config_path, "token123")
         html_out = app2.page_analysis()
         self.assertIn("レビュー履歴がまだありません", html_out)
+
+
+class EventComparisonTests(unittest.TestCase):
+    def setUp(self):
+        ets = NOW - 3 * DAY
+        self.ets = ets
+        self.store = FakeStore(
+            {
+                "100": [
+                    review("バグで落ちる", False, ets - 2 * DAY),
+                    review("面白い", True, ets - DAY),
+                    review("バグが直っていない", False, ets + DAY),
+                    review("バグ報告です", False, ets + 2 * DAY),
+                    review("楽しい", True, ets + DAY),
+                ]
+            },
+            events={
+                "100": [
+                    {"event_id": "ev1", "title": "アップデート1.1", "event_ts": ets}
+                ]
+            },
+        )
+
+    def test_before_after_counts_and_topics(self):
+        comp = A.event_comparison(self.store, "100", now=NOW, days=7)
+        self.assertIsNotNone(comp)
+        self.assertEqual(comp["before"]["total"], 2)
+        self.assertEqual(comp["before"]["down"], 1)
+        self.assertEqual(comp["after"]["total"], 3)
+        self.assertEqual(comp["after"]["down"], 2)
+        topics = {t["name"]: t for t in comp["topics"]}
+        self.assertEqual(topics["バグ"]["before_down"], 1)
+        self.assertEqual(topics["バグ"]["after_down"], 2)
+        self.assertTrue(comp["partial"])  # 後7日はまだそろっていない
+
+    def test_no_event_returns_none(self):
+        store = FakeStore({"100": []})
+        self.assertIsNone(A.event_comparison(store, "100", now=NOW))

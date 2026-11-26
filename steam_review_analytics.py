@@ -1068,6 +1068,72 @@ def snapshot_series(store, appid):
     return out
 
 
+def event_comparison(store, appid, event_id=None, now=None, days=7, config=None):
+    """分析画面用：イベント前後の比較を返す。
+
+    event_id が指定されればそのイベント、無ければ現在時刻以前で最も新しい
+    イベントを境に、前 days 日と後 days 日（後は現在時刻まで）を比べる。
+    返すのは、イベント情報、前後の件数・好評・低評価・好評率、低評価の
+    論点の内訳（前後の件数）、後ろの期間がまだそろっていないかどうか。
+    イベントが無ければ None。
+    """
+    now = int(now if now is not None else time.time())
+    event = None
+    if event_id is not None:
+        for candidate in store.list_events(appid):
+            if candidate.get("event_id") == event_id:
+                event = candidate
+                break
+    if event is None:
+        event = store.latest_event(appid, at_or_before=now)
+    if event is None:
+        return None
+    ets = int(event["event_ts"])
+    span = int(days) * DAY
+    before_reviews = store.reviews_between(appid, ets - span, ets)
+    after_end = min(ets + span, now)
+    after_reviews = store.reviews_between(appid, ets, after_end)
+    before = window_stats(before_reviews)
+    after = window_stats(after_reviews)
+    analytics_cfg = (config or {}).get("analytics", {}) or {}
+    topics = resolve_topic_dict(analytics_cfg.get("topics"), appid=appid)
+    before_counts = count_topics(before_reviews, topics)
+    after_counts = count_topics(after_reviews, topics)
+    topic_rows = sorted(
+        (
+            {
+                "name": name,
+                "before_down": before_counts[name]["down"],
+                "after_down": after_counts[name]["down"],
+            }
+            for name in topics
+            if before_counts[name]["down"] or after_counts[name]["down"]
+        ),
+        key=lambda t: (-(t["after_down"] - t["before_down"]), t["name"]),
+    )
+
+    def pack(stats):
+        return {
+            "total": stats["total"],
+            "up": stats["up"],
+            "down": stats["down"],
+            "up_ratio": stats["up_ratio"],
+        }
+
+    return {
+        "event": {
+            "event_id": event.get("event_id"),
+            "title": event.get("title") or "",
+            "event_ts": ets,
+        },
+        "days": int(days),
+        "partial": ets + span > now,
+        "before": pack(before),
+        "after": pack(after),
+        "topics": topic_rows,
+    }
+
+
 def evaluate_surge(store, appid, cfg=None, now=None):
     """急増判定。アラートすべきなら根拠の辞書を、そうでなければ None を返す。
 
